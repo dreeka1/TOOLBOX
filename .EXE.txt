@@ -1,0 +1,20 @@
+EJECUTAR EN POWERSHELL COMO ADMIN 
+
+Install-Module -Name ps2exe -Force -SkipPublisherCheck
+
+COMPILAR EL CODIGO A .EXE
+
+ps2exe -inputFile "C:\Users\derek\OneDrive\Escritorio\Servidor_CONTPAQi.ps1" -outputFile "C:\Users\derek\OneDrive\Escritorio\Servidor_CONTPAQi.exe" -requireAdmin
+
+
+
+ ps2exe -inputfile "C:\Users\Consu\OneDrive\Escritorio\DESARROLLO\PRUEBA.ps1" -outputFile "C:\Users\Consu\OneDrive\Escritorio\DESARROLLO\PRUEBA.exe" -requireAdmin
+
+
+
+CAMBIAR POLITICA DE SCRIPTS 
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+
+FORZAR LA CARGA DEL MODULO 
+Import-Module ps2exe -Force
