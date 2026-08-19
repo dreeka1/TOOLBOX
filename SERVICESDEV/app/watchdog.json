@@ -1,0 +1,6 @@
+{
+  "CheckIntervalSeconds": 5,
+  "StartTimeoutSeconds": 45,
+  "FailureCooldownMinutes": 5,
+  "ServiceNames": []
+}
