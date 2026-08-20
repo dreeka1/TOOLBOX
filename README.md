@@ -2,7 +2,7 @@
 
 > Soporte técnico, diagnóstico y operación diaria de CONTPAQi desde una sola interfaz ligera.
 
-**Versión 6.23 · PowerShell 5.1 · Windows Forms**
+**Versión definitiva 6.6 · PowerShell 5.1 · Windows Forms**
 
 CONTPAQi Toolbox es una herramienta desarrollada en PowerShell para concentrar tareas frecuentes de soporte y administración en equipos con sistemas CONTPAQi. Su interfaz gráfica busca reducir pasos manuales, organizar utilidades y facilitar el trabajo del consultor sin depender de una aplicación pesada.
 
@@ -19,6 +19,11 @@ En soporte técnico es común saltar entre consolas, rutas, servicios y herramie
 - Registro de actividad en `C:\ProgramData\CONTPAQiToolbox\Logs`.
 - Diseño ligero con indicadores visuales de estado, advertencia y error.
 - Preparado para distinguir funciones de servidor y terminal.
+- Diagnóstico terminal-servidor de puertos, firewall, SMB, rutas compartidas y licencias.
+- Integración opcional con Nmap y comprobación TCP nativa cuando no está instalado.
+- Diagnóstico inteligente con reporte PDF y análisis de salud SQL.
+- Reparaciones con confirmación escrita, actividad visible y validación final.
+- Monitor ServicesDev integrado en el mismo ejecutable portable.
 
 ## Requisitos
 
@@ -68,7 +73,7 @@ Incluye la versión de Toolbox y el registro correspondiente cuando reportes una
 
 ## Estado del proyecto
 
-Proyecto en evolución. La versión 6.23 conserva el enfoque de una sola herramienta portable, visual y práctica para soporte CONTPAQi.
+La versión 6.6 es la edición definitiva estable de esta línea: conserva el enfoque de una sola herramienta portable, visual y práctica para soporte CONTPAQi.
 
 ---
 
