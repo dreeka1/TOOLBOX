@@ -20,7 +20,7 @@ if ($consoleWnd -ne [IntPtr]::Zero) {
     [Win32]::ShowWindow($consoleWnd, 0)
 }
 
-$Script:Version          = '6.15.1'
+$Script:Version          = '6.6'
 $Script:MarcaAgua        = 'Desarrollado por Derek Salinas'
 $Script:ColorTitulo      = 'Cyan'
 $Script:ColorAcento      = 'White'
@@ -38,12 +38,15 @@ $Script:LogHeader    = $null
 $Script:HeaderTitle  = $null
 $Script:HeaderSub    = $null
 $Script:StatusLabel  = $null
+$Script:Sidebar      = $null
 $Script:ConsoleMode  = $false
 $Script:CurrentPanel = $null
 $Script:LogDirectory = Join-Path $env:ProgramData 'CONTPAQiToolbox\Logs'
 $Script:ReportDirectory = Join-Path $env:ProgramData 'CONTPAQiToolbox\Reportes'
 $Script:LogFile      = $null
 $Script:IsBusy       = $false
+$Script:LogMaxChars  = 300000
+$Script:InstanceMutex = $null
 $Script:LoginUser    = 'Derek'
 # SHA-256 de la contraseña autorizada; evita almacenarla como texto legible.
 $Script:LoginPasswordHash = '4f557cd8dec11335d75f31726e32d81441983eab5f477eb979b34365e1a72378'
@@ -79,6 +82,35 @@ function Get-TextSha256 {
     }
 }
 
+function Enter-ToolboxSingleInstance {
+    $creado = $false
+    foreach ($nombre in @('Global\CONTPAQiToolbox.SingleInstance', 'Local\CONTPAQiToolbox.SingleInstance')) {
+        try {
+            $mutex = [System.Threading.Mutex]::new($true, $nombre, [ref]$creado)
+            if ($creado) {
+                $Script:InstanceMutex = $mutex
+                return $true
+            }
+            $mutex.Dispose()
+            return $false
+        } catch [System.UnauthorizedAccessException] {
+            # Algunos dominios restringen mutex globales; se intenta el ámbito de sesión.
+            continue
+        } catch {
+            continue
+        }
+    }
+    # No se impide trabajar si Windows no permite crear el mecanismo de exclusión.
+    return $true
+}
+
+function Exit-ToolboxSingleInstance {
+    if (-not $Script:InstanceMutex) { return }
+    try { $Script:InstanceMutex.ReleaseMutex() } catch { }
+    try { $Script:InstanceMutex.Dispose() } catch { }
+    $Script:InstanceMutex = $null
+}
+
 function Convert-ConsoleColorToDrawing {
     param([ConsoleColor]$Color)
     switch ($Color) {
@@ -110,10 +142,30 @@ function Write-Host {
         [Switch] $NoNewline,
         [Switch] $Separator
     )
-    if ($Script:LogBox -and -not $Script:ConsoleMode) {
-        $text = $Object.ToString()
+    if ($Script:LogBox -and -not $Script:ConsoleMode -and -not $Script:LogBox.IsDisposed) {
+        $text = if ($null -eq $Object) { '' } else { [string]$Object }
         if (-not $NoNewline) { $text += "`r`n" }
         $color = Convert-ConsoleColorToDrawing -Color $ForegroundColor
+        # Evita que sesiones extensas degraden progresivamente la interfaz.
+        # Se conserva aproximadamente el 80 % más reciente y se corta en una
+        # línea completa para no dejar fragmentos difíciles de interpretar.
+        if ($Script:LogMaxChars -gt 0 -and ($Script:LogBox.TextLength + $text.Length) -gt $Script:LogMaxChars) {
+            $objetivoConservado = [Math]::Max(0, [int]($Script:LogMaxChars * 0.75))
+            $minimoAEliminar = [Math]::Max(0, $Script:LogBox.TextLength + $text.Length - $objetivoConservado)
+            $corte = $Script:LogBox.Text.IndexOf("`n", $minimoAEliminar)
+            if ($corte -lt 0) { $corte = [Math]::Min($minimoAEliminar, $Script:LogBox.TextLength) }
+            elseif ($corte -lt $Script:LogBox.TextLength) { $corte++ }
+            if ($corte -gt 0) {
+                $eraSoloLectura = $Script:LogBox.ReadOnly
+                try {
+                    if ($eraSoloLectura) { $Script:LogBox.ReadOnly = $false }
+                    $Script:LogBox.Select(0, $corte)
+                    $Script:LogBox.SelectedText = ''
+                } finally {
+                    if ($eraSoloLectura) { $Script:LogBox.ReadOnly = $true }
+                }
+            }
+        }
         $Script:LogBox.SelectionStart = $Script:LogBox.TextLength
         $Script:LogBox.SelectionLength = 0
         $Script:LogBox.SelectionColor = $color
@@ -371,6 +423,9 @@ function Set-ModernButtonStyle {
         [System.Drawing.Color]$TextColor = $Script:GUIColors.Text,
         [System.Drawing.Color]$HoverColor = $Script:GUIColors.ButtonHover
     )
+    if ($BaseColor.IsEmpty) { $BaseColor = $Script:GUIColors.Button }
+    if ($TextColor.IsEmpty) { $TextColor = $Script:GUIColors.Text }
+    if ($HoverColor.IsEmpty) { $HoverColor = $Script:GUIColors.ButtonHover }
     $Button.UseVisualStyleBackColor = $false
     $Button.FlatStyle = 'Flat'
     $Button.FlatAppearance.BorderSize = 1
@@ -860,7 +915,6 @@ function Get-ServiciosSQLRelacionados {
 
 $ServiciosSACI      = @('Saci_CONTPAQi')
 $ServiciosLicencias = @('AppKeyLicenseServer_NOMINAS', 'AppKeyLicenseServer_Compac_V4', 'AppKeyLicenseServer_XMLenLinea', 'AuthServer_XMLenLinea')
-$ServiciosSQL       = @(Get-ServiciosSQLRelacionados)
 
 $ProcesosCONTPAQi = @(
     'SRVPAQi', 'Formularios', 'Contabilidad', 'Nominas', 'Bancos',
@@ -934,14 +988,6 @@ $Script:SistemasMapa = @{
 
 # --- UTILIDADES DE INTERFAZ ---
 
-function Set-ConsolaTamano {
-    if ($Script:ConsoleMode) {
-        try {
-            $host.UI.RawUI.WindowSize = New-Object System.Management.Automation.Host.Size(78, 46)
-            $host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(78, 9999)
-        } catch { }
-    }
-}
 
 function Write-Linea {
     param([string]$Texto = '', [string]$Color = 'Gray', [switch]$Centrado)
@@ -1056,15 +1102,6 @@ function Write-BarraEstado {
     }
 }
 
-function Show-Pausa {
-    param([string]$Mensaje = 'Presiona Enter para continuar...')
-    if ($Script:GUIForm -and -not $Script:ConsoleMode) {
-        [System.Windows.Forms.MessageBox]::Show($Mensaje, 'Toolbox', 'OK', 'Information') | Out-Null
-    } else {
-        Write-Host ''
-        Read-Host $Mensaje | Out-Null
-    }
-}
 
 function Confirmar-Accion {
     param([string]$Mensaje)
@@ -1140,9 +1177,17 @@ function Show-GUIInput {
     $form.AcceptButton = $okBtn
     $form.CancelButton = $cancelBtn
 
-    $result = $form.ShowDialog()
-    if ($result -eq 'OK') { return $txt.Text }
-    return $null
+    try {
+        $result = if ($Script:GUIForm -and -not $Script:GUIForm.IsDisposed) {
+            $form.ShowDialog($Script:GUIForm)
+        } else {
+            $form.ShowDialog()
+        }
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) { return [string]$txt.Text }
+        return $null
+    } finally {
+        $form.Dispose()
+    }
 }
 
 function Confirmar-Movimiento {
@@ -1255,12 +1300,20 @@ function Request-Administrator {
 }
 
 function Get-PerfilEquipo {
-    $tieneSQL = ($ServiciosSQL.Count -gt 0)
+    param([switch]$Actualizar)
+    if (-not $Actualizar -and $Script:PerfilEquipoCache -and $Script:PerfilEquipoCacheFecha -and
+        ((Get-Date) - $Script:PerfilEquipoCacheFecha).TotalSeconds -lt 60) {
+        return $Script:PerfilEquipoCache
+    }
+    $tieneSQL = (@(Get-ServiciosMotorSQL).Count -gt 0)
     $tieneAuth = (Get-ServiciosTerminal).Count -gt 0
-    if ($tieneSQL -and $tieneAuth) { return 'Servidor+Terminal' }
-    if ($tieneSQL) { return 'Servidor RDS/SQL' }
-    if ($tieneAuth) { return 'Terminal/Estacion' }
-    return 'Equipo generico'
+    $perfil = if ($tieneSQL -and $tieneAuth) { 'Servidor+Terminal' }
+        elseif ($tieneSQL) { 'Servidor RDS/SQL' }
+        elseif ($tieneAuth) { 'Terminal/Estacion' }
+        else { 'Equipo generico' }
+    $Script:PerfilEquipoCache = $perfil
+    $Script:PerfilEquipoCacheFecha = Get-Date
+    return $perfil
 }
 
 # --- LOGIN GUI ---
@@ -1382,37 +1435,43 @@ function Show-Login {
     $loginForm.AcceptButton = $loginBtn
     $loginForm.CancelButton = $cancelBtn
 
-    $intentosMaximos = 3
-    for ($intento = 1; $intento -le $intentosMaximos; $intento++) {
-        $titleLabel.Text = "CONTPAQi TOOLBOX  ($intento/$intentosMaximos)"
-        $userBox.Text = ''
-        $passBox.Text = ''
-        $loginForm.Text = "CONTPAQi Toolbox - Intento $intento de $intentosMaximos"
+    try {
+        $intentosMaximos = 3
+        for ($intento = 1; $intento -le $intentosMaximos; $intento++) {
+            $titleLabel.Text = "CONTPAQi TOOLBOX  ($intento/$intentosMaximos)"
+            $userBox.Clear()
+            $passBox.Clear()
+            # ShowDialog conserva DialogResult entre aperturas. Restablecerlo
+            # evita consumir automáticamente los intentos tras un acceso fallido.
+            $loginForm.DialogResult = [System.Windows.Forms.DialogResult]::None
+            $loginForm.Text = "CONTPAQi Toolbox - Intento $intento de $intentosMaximos"
 
-        $result = $loginForm.ShowDialog()
-        if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
+            $result = $loginForm.ShowDialog()
+            if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
 
-        $usuarioInput = $userBox.Text
-        $contrasenaInput = $passBox.Text
+            $usuarioInput = [string]$userBox.Text
+            $contrasenaInput = [string]$passBox.Text
 
-        $usuarioValido = $usuarioInput.Trim() -ceq $Script:LoginUser
-        $hashValido = (Get-TextSha256 -Text $contrasenaInput) -ceq $Script:LoginPasswordHash
-        $contrasenaInput = $null
+            $usuarioValido = $usuarioInput.Trim() -ceq $Script:LoginUser
+            $hashValido = (Get-TextSha256 -Text $contrasenaInput) -ceq $Script:LoginPasswordHash
+            $contrasenaInput = $null
+            $passBox.Clear()
 
-        if ($usuarioValido -and $hashValido) {
-            Write-Log -Mensaje "Acceso autorizado para $usuarioInput." -Nivel INFO
-            $loginForm.Close()
-            return $true
+            if ($usuarioValido -and $hashValido) {
+                Write-Log -Mensaje "Acceso autorizado para $usuarioInput." -Nivel INFO
+                return $true
+            }
+
+            [System.Windows.Forms.MessageBox]::Show(
+                "Usuario o contraseña incorrectos.`n`nIntento $intento de $intentosMaximos.",
+                'Error de acceso', 'OK', 'Error'
+            ) | Out-Null
         }
-
-        [System.Windows.Forms.MessageBox]::Show(
-            "Usuario o contraseña incorrectos.`n`nIntento $intento de $intentosMaximos.",
-            'Error de acceso', 'OK', 'Error'
-        ) | Out-Null
+        return $false
+    } finally {
+        $passBox.Clear()
+        $loginForm.Dispose()
     }
-
-    $loginForm.Close()
-    return $false
 }
 
 # --- GESTION DE SERVICIOS ---
@@ -1457,9 +1516,6 @@ function Get-ServiciosTerminal {
     return $resultado
 }
 
-function Get-NombresServiciosTerminal {
-    return (Get-ServiciosTerminal | ForEach-Object { $_.Servicio.Name })
-}
 
 function Get-EstadoTexto {
     param([System.ServiceProcess.ServiceController]$Servicio)
@@ -1522,162 +1578,6 @@ function Show-EstadoServiciosTerminal {
     }
 }
 
-function Wait-ServicioEstado {
-    param(
-        [string]$NombreServicio,
-        [ValidateSet('Running', 'Stopped')]
-        [string]$EstadoDeseado,
-        [int]$MaxIntentos = 40
-    )
-    $intentos = 0
-    do {
-        $svc = Get-Service -Name $NombreServicio -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status.ToString() -eq $EstadoDeseado) { return $true }
-        Refresh-Log
-        Start-Sleep -Milliseconds 300
-        $intentos++
-    } while ($intentos -lt $MaxIntentos)
-    return $false
-}
-
-function Start-GrupoServicios {
-    param(
-        [array]$listaServicios,
-        [string]$nombreGrupo,
-        [switch]$SoloDetenidos,
-        [switch]$ConfirmacionOmitida
-    )
-
-    Write-Encabezado -Titulo 'INICIO DE SERVICIOS' -Subtitulo $nombreGrupo -Color $Script:ColorTerminal
-    $serviciosEncontrados = @()
-
-    foreach ($svc in $listaServicios) {
-        $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
-        if ($svcObj) { $serviciosEncontrados += $svcObj }
-        else { Write-Log -Mensaje "Servicio '$svc' no instalado." -Nivel INFO }
-    }
-
-    if ($serviciosEncontrados.Count -eq 0) {
-        Write-Log -Mensaje 'No se detectaron servicios.' -Nivel WARN
-        return
-    }
-    if ($SoloDetenidos -and @($serviciosEncontrados | Where-Object Status -ne 'Running').Count -eq 0) {
-        Write-Log -Mensaje 'Todos los servicios seleccionados ya estan en ejecucion; no se requiere ningun cambio.' -Nivel OK
-        return
-    }
-    if (-not $ConfirmacionOmitida -and -not (Confirmar-Movimiento -Frase 'INICIAR SERVICIOS' `
-        -Accion "Iniciar servicios: $nombreGrupo" `
-        -Detalle 'Se modificara el estado de los servicios detenidos seleccionados.')) { return }
-
-    $iniciados = 0
-    $fallidos = 0
-    foreach ($svc in $serviciosEncontrados) {
-        if ($SoloDetenidos -and $svc.Status -eq 'Running') {
-            Write-Log -Mensaje "$($svc.DisplayName) ya esta en ejecucion." -Nivel INFO
-            continue
-        }
-        Write-Log -Mensaje "Iniciando $($svc.DisplayName)..." -Nivel PROGRESS
-        $resultadoInicio = Invoke-ServiceActionResponsive -Nombre $svc.Name -Accion Start -TimeoutSegundos 75
-        if (-not $resultadoInicio.Correcto) {
-            $fallidos++
-            Write-Log -Mensaje "No se pudo iniciar $($svc.Name): $($resultadoInicio.Error)" -Nivel ERROR
-            continue
-        }
-        Write-Log -Mensaje "$($svc.Name) iniciado." -Nivel OK
-        $iniciados++
-    }
-
-    $nivelFinal = if ($fallidos -eq 0) { 'OK' } else { 'WARN' }
-    Write-Log -Mensaje "Resultado: $iniciados iniciado(s), $fallidos fallido(s)." -Nivel $nivelFinal
-}
-
-function Reiniciar-GrupoServicios {
-    param(
-        [array]$listaServicios,
-        [string]$nombreGrupo,
-        [switch]$ConfirmacionOmitida
-    )
-
-    Write-Encabezado -Titulo 'REINICIO DE SERVICIOS' -Subtitulo $nombreGrupo -Color 'Cyan'
-    $serviciosEncontrados = @()
-
-    foreach ($svc in $listaServicios) {
-        $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
-        if ($svcObj) { $serviciosEncontrados += $svcObj }
-        else { Write-Log -Mensaje "Servicio '$svc' no instalado." -Nivel INFO }
-    }
-
-    if ($serviciosEncontrados.Count -eq 0) {
-        Write-Log -Mensaje 'No se detectaron servicios de este grupo.' -Nivel WARN
-        return
-    }
-    if (-not $ConfirmacionOmitida -and -not (Confirmar-Movimiento -Frase 'REINICIAR SERVICIOS' `
-        -Accion "Reiniciar servicios: $nombreGrupo" `
-        -Detalle 'Los servicios se detendran temporalmente; las aplicaciones conectadas pueden perder su sesion.')) { return }
-
-    $fallidos = 0
-    Write-Host ''
-    Write-Linea -Texto '--- Deteniendo servicios ---' -Color $Script:ColorAdvertencia
-    foreach ($svc in $serviciosEncontrados) {
-        $currentSvc = Get-Service -Name $svc.Name
-        if ($currentSvc.Status -eq 'Running') {
-            Write-Log -Mensaje "Deteniendo $($svc.DisplayName)..." -Nivel PROGRESS
-            $resultadoDetener = Invoke-ServiceActionResponsive -Nombre $svc.Name -Accion Stop -TimeoutSegundos 60
-            if (-not $resultadoDetener.Correcto) {
-                $fallidos++
-                Write-Log -Mensaje "No se pudo detener $($svc.Name): $($resultadoDetener.Error)" -Nivel ERROR
-                continue
-            }
-            Write-Log -Mensaje "$($svc.Name) detenido." -Nivel OK
-        } else {
-            Write-Log -Mensaje "$($svc.DisplayName) ya estaba detenido." -Nivel INFO
-        }
-    }
-
-    Write-Log -Mensaje 'Espera de seguridad (3 seg)...' -Nivel INFO
-    Wait-Responsive -Seconds 3
-
-    Write-Host ''
-    Write-Linea -Texto '--- Iniciando servicios ---' -Color $Script:ColorExito
-    [array]::Reverse($serviciosEncontrados)
-    foreach ($svc in $serviciosEncontrados) {
-        Write-Log -Mensaje "Iniciando $($svc.DisplayName)..." -Nivel PROGRESS
-        $resultadoInicio = Invoke-ServiceActionResponsive -Nombre $svc.Name -Accion Start -TimeoutSegundos 75
-        if (-not $resultadoInicio.Correcto) {
-            $fallidos++
-            Write-Log -Mensaje "No se pudo iniciar $($svc.Name): $($resultadoInicio.Error)" -Nivel ERROR
-            continue
-        }
-        Write-Log -Mensaje "$($svc.Name) en ejecucion." -Nivel OK
-    }
-
-    $nivelFinal = if ($fallidos -eq 0) { 'OK' } else { 'WARN' }
-    $mensajeFinal = if ($fallidos -eq 0) {
-        "Reinicio de '$nombreGrupo' completado y verificado."
-    } else {
-        "Reinicio de '$nombreGrupo' finalizado con $fallidos incidencia(s). Revisa el detalle anterior."
-    }
-    Write-Log -Mensaje $mensajeFinal -Nivel $nivelFinal
-}
-
-function Reiniciar-TodosServiciosTerminal {
-    param([switch]$ConfirmacionOmitida)
-    $nombres = Get-NombresServiciosTerminal
-    if ($nombres.Count -eq 0) {
-        Write-Encabezado -Titulo 'SIN SERVICIOS TERMINAL' -Subtitulo 'No hay AuthServer/Licencias detectados' -Color $Script:ColorError
-        return
-    }
-    Reiniciar-GrupoServicios -listaServicios $nombres -nombreGrupo 'TODOS LOS AUTHSERVER / LICENCIAS (TERMINAL)' -ConfirmacionOmitida:$ConfirmacionOmitida
-}
-
-function Iniciar-ServiciosTerminalDetenidos {
-    $nombres = Get-NombresServiciosTerminal
-    if ($nombres.Count -eq 0) {
-        Write-Encabezado -Titulo 'SIN SERVICIOS TERMINAL' -Subtitulo 'No hay AuthServer/Licencias detectados' -Color $Script:ColorError
-        return
-    }
-    Start-GrupoServicios -listaServicios $nombres -nombreGrupo 'SERVICIOS DETENIDOS (TERMINAL)' -SoloDetenidos
-}
 
 function Get-ServiciosReparacionTerminal {
     $encontrados = @{}
@@ -1698,7 +1598,10 @@ function Get-ServiciosReparacionTerminal {
 }
 
 function Start-ServiciosTerminalVerificado {
-    param([ValidateRange(1, 3)][int]$Intentos = 2)
+    param(
+        [ValidateRange(1, 3)][int]$Intentos = 2,
+        [switch]$RecuperarDeshabilitados
+    )
 
     $servicios = @(Get-ServiciosReparacionTerminal | Sort-Object `
         @{ Expression = { Get-OrdenInicioServicioCONTPAQi -Servicio $_ } }, Name)
@@ -1708,9 +1611,25 @@ function Start-ServiciosTerminalVerificado {
     foreach ($servicio in $servicios) {
         $nombre = $servicio.Name
         if (Test-ServicioDeshabilitado -Nombre $nombre) {
-            $omitidos++
-            Write-Log -Mensaje "$nombre esta deshabilitado; se conserva su configuracion." -Nivel WARN
-            continue
+            if (-not $RecuperarDeshabilitados) {
+                $omitidos++
+                Write-Log -Mensaje "$nombre esta deshabilitado; se conserva su configuracion." -Nivel WARN
+                continue
+            }
+            try {
+                Set-Service -Name $nombre -StartupType Manual -ErrorAction Stop
+                Write-Log -Mensaje "$nombre estaba deshabilitado; se restablecio a inicio Manual." -Nivel WARN
+            } catch {
+                $fallidos.Add($nombre)
+                Write-Log -Mensaje "No se pudo recuperar $($nombre): $($_.Exception.Message)" -Nivel ERROR
+                continue
+            }
+        }
+        $actualDependencias = Get-Service -Name $nombre -ErrorAction SilentlyContinue
+        foreach ($dependencia in @($actualDependencias.ServicesDependedOn)) {
+            if ($dependencia.Status -eq 'Running' -or (Test-ServicioDeshabilitado -Nombre $dependencia.ServiceName)) { continue }
+            $resultadoDep = Invoke-ServiceActionResponsive -Nombre $dependencia.ServiceName -Accion Start -TimeoutSegundos 60
+            Write-Log -Mensaje $(if ($resultadoDep.Correcto) { "Dependencia $($dependencia.ServiceName) activa para $nombre." } else { "Dependencia $($dependencia.ServiceName) con incidencia: $($resultadoDep.Error)" }) -Nivel $(if ($resultadoDep.Correcto) { 'OK' } else { 'WARN' })
         }
         $iniciado = $false
         $ultimoError = ''
@@ -1736,38 +1655,96 @@ function Start-ServiciosTerminalVerificado {
             Write-Log -Mensaje "No se pudo iniciar $($nombre): $ultimoError" -Nivel ERROR
         }
     }
+    Wait-Responsive -Seconds 2
+    foreach ($servicioFinal in @(Get-ServiciosReparacionTerminal)) {
+        if ((Test-ServicioDeshabilitado -Nombre $servicioFinal.Name) -or $servicioFinal.Status -eq 'Running') { continue }
+        if (-not $fallidos.Contains($servicioFinal.Name)) { $fallidos.Add($servicioFinal.Name) }
+        Write-Log -Mensaje "$($servicioFinal.Name) no permanecio activo despues de la reparacion." -Nivel ERROR
+    }
     return [PSCustomObject]@{
         Total = $servicios.Count; Correctos = $correctos; Omitidos = $omitidos
         Fallidos = $fallidos.Count; FallidosNombres = @($fallidos)
     }
 }
 
+function Invoke-ReparacionComponentesWindowsTerminal {
+    $codigo = @'
+$resultadosSfc = @()
+$dismCheck = & dism.exe /Online /Cleanup-Image /CheckHealth /English 2>&1
+$dismCheckCode = $LASTEXITCODE
+$dismCheckText = (($dismCheck -join ' ') -replace '\s+', ' ').Trim()
+$dismRestoreCode = $null
+$dismRestoreText = ''
+$repairable = ($dismCheckText -match '(?i)component store is repairable|corruption detected')
+if ($dismCheckCode -eq 0 -and $repairable) {
+    $dismRestore = & dism.exe /Online /Cleanup-Image /RestoreHealth /English 2>&1
+    $dismRestoreCode = $LASTEXITCODE
+    $dismRestoreText = (($dismRestore -join ' ') -replace '\s+', ' ').Trim()
+}
+$archivos = @(
+    (Join-Path $env:SystemRoot 'System32\msxml6.dll'),
+    (Join-Path $env:SystemRoot 'System32\winhttp.dll'),
+    (Join-Path $env:SystemRoot 'System32\crypt32.dll')
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+foreach ($archivo in $archivos) {
+    $salida = & sfc.exe "/scanfile=$archivo" 2>&1
+    $resultadosSfc += [PSCustomObject]@{
+        Archivo = $archivo; ExitCode = $LASTEXITCODE
+        Salida = (($salida -join ' ') -replace '\s+', ' ').Trim()
+    }
+}
+[PSCustomObject]@{
+    DismCheckCode = $dismCheckCode; DismCheckText = $dismCheckText; ReparacionNecesaria = $repairable
+    DismRestoreCode = $dismRestoreCode; DismRestoreText = $dismRestoreText; Sfc = $resultadosSfc
+}
+'@
+    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -TimeoutSeconds 2400 -Activity 'Validando componentes de Windows'
+    if (-not $worker.Correcto -or $worker.Timeout -or -not $worker.Resultado) {
+        return [PSCustomObject]@{ Correcto = $false; Error = $worker.Error; Resultado = $worker.Resultado }
+    }
+    $resultado = $worker.Resultado
+    $dismCorrecto = ($resultado.DismCheckCode -eq 0 -and ($null -eq $resultado.DismRestoreCode -or $resultado.DismRestoreCode -eq 0))
+    $sfcFallidos = @($resultado.Sfc | Where-Object { $_.ExitCode -ne 0 })
+    return [PSCustomObject]@{
+        Correcto = ($dismCorrecto -and $sfcFallidos.Count -eq 0); Error = $null; Resultado = $resultado
+        DismCorrecto = $dismCorrecto; SfcFallidos = $sfcFallidos.Count
+    }
+}
+
 function Reset-TerminalRapido {
-    Write-Encabezado -Titulo 'REPARACION COMPLETA DE TERMINAL' -Subtitulo 'Aplicaciones + servicios + temporales + red + validacion' -Color $Script:ColorTerminal
+    Write-Encabezado -Titulo 'REPARACION AVANZADA DE TERMINAL' -Subtitulo 'Procesos + servicios + ACL + Windows + red + verificacion real' -Color $Script:ColorTerminal
     Write-Log -Mensaje 'La reparacion trabaja solo sobre esta estacion: no detiene SQL ni servicios del servidor remoto.' -Nivel INFO
     if (-not (Confirmar-Movimiento -Frase 'REPARAR TERMINAL' `
         -Accion 'Reparar esta terminal CONTPAQi' `
-        -Detalle 'Se cerraran aplicaciones locales, reiniciaran AuthServer/licencias, limpiaran temporales y validaran red, binarios y permisos.')) { return }
+        -Detalle 'Se cerraran aplicaciones locales, repararan permisos con respaldo, validaran componentes Windows y reiniciaran AuthServer/licencias. Puede tardar varios minutos.')) { return }
 
     $inicio = Get-Date
     $incidencias = 0
     $advertencias = 0
+    $servidorValidado = $null
+    $archivoAcl = $null
     $proteccionServicesDev = Suspend-ServicesDevForRepair
     if (-not $proteccionServicesDev.Correcto) { return }
     try {
-        Write-Log -Mensaje '[1/10] Inventario de la terminal y comprobaciones previas...' -Nivel PROGRESS
+        Write-Log -Mensaje '[1/13] Inventario, espacio y estado previo de la terminal...' -Nivel PROGRESS
         $serviciosTerminal = @(Get-ServiciosReparacionTerminal | Sort-Object `
             @{ Expression = { Get-OrdenInicioServicioCONTPAQi -Servicio $_ } }, Name)
         $procesosTerminal = @((Get-ProcesosCONTPAQi) + (Get-ProcesosPID)) |
             Where-Object { -not $_.EsToolbox } | Sort-Object PID -Unique
         $rutasTerminal = @(Get-RutasCONTPAQi)
         Write-Log -Mensaje "Detectados: $($serviciosTerminal.Count) servicios de terminal | $($procesosTerminal.Count) procesos | $($rutasTerminal.Count) rutas CONTPAQi." -Nivel INFO
+        $unidadSistema = Get-PSDrive -Name ([IO.Path]::GetPathRoot($env:SystemRoot).TrimEnd(':\')) -PSProvider FileSystem -ErrorAction SilentlyContinue
+        if ($unidadSistema) {
+            $libresGB = [math]::Round($unidadSistema.Free / 1GB, 2)
+            Write-Log -Mensaje "Espacio disponible en $($unidadSistema.Name): $libresGB GB." -Nivel $(if ($libresGB -ge 5) { 'OK' } else { 'WARN' })
+            if ($libresGB -lt 5) { $advertencias++ }
+        }
         if ($serviciosTerminal.Count -eq 0) {
             $advertencias++
             Write-Log -Mensaje 'No se detectaron AuthServer o servicios de licencia locales; se continuara con las demas validaciones.' -Nivel WARN
         }
 
-        Write-Log -Mensaje '[2/10] Cerrando aplicaciones CONTPAQi/PID de esta estacion...' -Nivel PROGRESS
+        Write-Log -Mensaje '[2/13] Cerrando aplicaciones CONTPAQi/PID de esta estacion...' -Nivel PROGRESS
         foreach ($proceso in $procesosTerminal) {
             if (Stop-ProcesoForzado -ProcessId $proceso.PID -TimeoutSegundos 10) {
                 Write-Log -Mensaje "PID $($proceso.PID) ($($proceso.Nombre)) cerrado." -Nivel OK
@@ -1778,7 +1755,7 @@ function Reset-TerminalRapido {
         }
         if ($procesosTerminal.Count -eq 0) { Write-Log -Mensaje 'No habia aplicaciones CONTPAQi abiertas.' -Nivel OK }
 
-        Write-Log -Mensaje '[3/10] Deteniendo servicios locales de licencia y AuthServer...' -Nivel PROGRESS
+        Write-Log -Mensaje '[3/13] Deteniendo servicios locales de licencia y AuthServer...' -Nivel PROGRESS
         $serviciosStop = @($serviciosTerminal)
         [array]::Reverse($serviciosStop)
         foreach ($servicio in $serviciosStop) {
@@ -1793,10 +1770,14 @@ function Reset-TerminalRapido {
             }
         }
 
-        Write-Log -Mensaje '[4/10] Limpiando temporales seguros de CONTPAQi...' -Nivel PROGRESS
+        Write-Log -Mensaje '[4/13] Limpiando caches y temporales seguros de CONTPAQi...' -Nivel PROGRESS
         $temporalesTerminal = @(
+            (Join-Path $env:TEMP 'Compac'),
+            (Join-Path $env:TEMP 'CONTPAQi'),
             (Join-Path $env:LOCALAPPDATA 'Temp\Compac'),
             (Join-Path $env:LOCALAPPDATA 'Temp\CONTPAQi'),
+            (Join-Path $env:ProgramData 'Compac\Temp'),
+            (Join-Path $env:ProgramData 'CONTPAQi\Temp'),
             'C:\Windows\Temp\Compac',
             'C:\Windows\Temp\CONTPAQi'
         ) | Select-Object -Unique
@@ -1804,7 +1785,7 @@ function Reset-TerminalRapido {
         foreach ($ruta in $temporalesTerminal) { $eliminados += Clear-TemporalSeguro -Ruta $ruta }
         Write-Log -Mensaje "Limpieza terminada: $eliminados elemento(s) eliminados; los archivos en uso se conservaron." -Nivel OK
 
-        Write-Log -Mensaje '[5/10] Renovando DNS y recuperando dependencias de Windows...' -Nivel PROGRESS
+        Write-Log -Mensaje '[5/13] Renovando DNS y recuperando dependencias de Windows...' -Nivel PROGRESS
         $dns = Invoke-DnsFlushResponsive
         if ($dns.Correcto) { Write-Log -Mensaje 'Cache DNS renovada correctamente.' -Nivel OK }
         else { $advertencias++; Write-Log -Mensaje "No se pudo renovar DNS: $($dns.Error)" -Nivel WARN }
@@ -1826,8 +1807,19 @@ function Reset-TerminalRapido {
             }
             Write-Log -Mensaje "Dependencia $nombre activa." -Nivel OK
         }
+        $servicioHora = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+        if ($servicioHora -and $servicioHora.Status -eq 'Running') {
+            $sincronizacion = Invoke-ProcessResponsive -FilePath (Join-Path $env:SystemRoot 'System32\w32tm.exe') `
+                -ArgumentList '/resync /nowait' -TimeoutSeconds 30 -Activity 'Sincronizando hora de Windows' -Hidden
+            if ($sincronizacion.Correcto -and $sincronizacion.ExitCode -eq 0) {
+                Write-Log -Mensaje 'Sincronizacion de hora solicitada correctamente.' -Nivel OK
+            } else {
+                $advertencias++
+                Write-Log -Mensaje 'Windows no acepto la resincronizacion inmediata; se conserva el servicio activo.' -Nivel WARN
+            }
+        }
 
-        Write-Log -Mensaje '[6/10] Auditando rutas, ejecutables y permisos locales...' -Nivel PROGRESS
+        Write-Log -Mensaje '[6/13] Auditando rutas, ejecutables y permisos locales...' -Nivel PROGRESS
         foreach ($servicio in $serviciosTerminal) {
             try {
                 $nombreSeguro = $servicio.Name.Replace("'", "''")
@@ -1855,18 +1847,56 @@ function Reset-TerminalRapido {
             }
         }
 
-        Write-Log -Mensaje '[7/10] Iniciando y verificando AuthServer/licencias...' -Nivel PROGRESS
-        $resultadoServicios = Start-ServiciosTerminalVerificado -Intentos 2
+        Write-Log -Mensaje '[7/13] Aplicando permisos oficiales y Centro de confianza de Excel con respaldo...' -Nivel PROGRESS
+        $resultadoPermisos = Invoke-RepararPermisosTerminalCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+        if ($resultadoPermisos) {
+            $archivoAcl = $resultadoPermisos.ArchivoRespaldo
+            if ($resultadoPermisos.Correcto) {
+                Write-Log -Mensaje "Permisos verificados: $($resultadoPermisos.Correctos) ruta(s) correcta(s)." -Nivel OK
+            } else {
+                $incidencias += [math]::Max(1, [int]$resultadoPermisos.Fallidos)
+                Write-Log -Mensaje "La reparacion de permisos termino con $($resultadoPermisos.Fallidos) incidencia(s)." -Nivel ERROR
+            }
+        } else {
+            $incidencias++
+            Write-Log -Mensaje 'La reparacion de permisos no devolvio un resultado verificable.' -Nivel ERROR
+        }
+        $resultadoExcel = Invoke-ConfigurarCentroConfianzaExcelCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+        if (-not $resultadoExcel.Correcto) {
+            $incidencias += [math]::Max(1, [int]$resultadoExcel.Fallidos)
+            Write-Log -Mensaje 'El Centro de confianza de Excel no quedo completamente configurado.' -Nivel ERROR
+        } elseif (-not $resultadoExcel.Omitido) {
+            Write-Log -Mensaje "Centro de confianza de Excel verificado en $($resultadoExcel.Correctos) version(es)." -Nivel OK
+        }
+
+        Write-Log -Mensaje '[8/13] Validando y reparando componentes Windows usados por CONTPAQi...' -Nivel PROGRESS
+        $resultadoWindows = Invoke-ReparacionComponentesWindowsTerminal
+        if ($resultadoWindows.Correcto) {
+            if ($resultadoWindows.Resultado.ReparacionNecesaria) {
+                Write-Log -Mensaje 'DISM detecto corrupcion y RestoreHealth finalizo correctamente.' -Nivel OK
+            } else {
+                Write-Log -Mensaje 'DISM no detecto corrupcion pendiente en la imagen de Windows.' -Nivel OK
+            }
+            Write-Log -Mensaje 'SFC valido MSXML, WinHTTP y Crypt32 sin incidencias.' -Nivel OK
+        } else {
+            $advertencias++
+            $detalleWindows = if ($resultadoWindows.Error) { $resultadoWindows.Error } else { "DISM correcto: $($resultadoWindows.DismCorrecto) | SFC con incidencia: $($resultadoWindows.SfcFallidos)" }
+            Write-Log -Mensaje "Windows termino con observaciones: $detalleWindows" -Nivel WARN
+        }
+
+        Write-Log -Mensaje '[9/13] Iniciando y verificando AuthServer/licencias...' -Nivel PROGRESS
+        $resultadoServicios = Start-ServiciosTerminalVerificado -Intentos 3 -RecuperarDeshabilitados
         $incidencias += $resultadoServicios.Fallidos
         Write-Log -Mensaje "Terminal: $($resultadoServicios.Correctos) activos, $($resultadoServicios.Fallidos) con incidencia, $($resultadoServicios.Omitidos) deshabilitados de $($resultadoServicios.Total)." -Nivel $(if ($resultadoServicios.Fallidos -eq 0) { 'OK' } else { 'WARN' })
 
-        Write-Log -Mensaje '[8/10] Detectando y validando comunicacion con el servidor...' -Nivel PROGRESS
+        Write-Log -Mensaje '[10/13] Detectando y validando comunicacion con el servidor...' -Nivel PROGRESS
         $candidatosServidor = @(Find-ServidoresCONTPAQi)
         if ($candidatosServidor.Count -eq 0) {
             $advertencias++
             Write-Log -Mensaje 'No se encontro un servidor configurado. Revisa nombre del servidor, VPN o configuracion de la terminal.' -Nivel WARN
         } else {
             $servidor = $candidatosServidor[0]
+            $servidorValidado = $servidor
             $puertos = @($servidor.PuertosAbiertos)
             if ($servidor.IPs.Count -gt 0 -and $puertos.Count -gt 0) {
                 Write-Log -Mensaje "Servidor detectado: $($servidor.Host) -> $($servidor.IPs -join ', ') | Puertos disponibles: $($puertos -join ', ')." -Nivel OK
@@ -1879,7 +1909,7 @@ function Reset-TerminalRapido {
             }
         }
 
-        Write-Log -Mensaje '[9/10] Auditoria final de la terminal...' -Nivel PROGRESS
+        Write-Log -Mensaje '[11/13] Segunda auditoria de servicios y comunicacion...' -Nivel PROGRESS
         $detenidosFinales = @(Get-ServiciosReparacionTerminal | Where-Object {
             -not (Test-ServicioDeshabilitado -Nombre $_.Name) -and $_.Status -ne 'Running'
         })
@@ -1889,27 +1919,63 @@ function Reset-TerminalRapido {
         } else {
             Write-Log -Mensaje 'Todos los servicios de terminal habilitados quedaron activos.' -Nivel OK
         }
+
+        Write-Log -Mensaje '[12/13] Revisando eventos generados durante la reparacion...' -Nivel PROGRESS
+        $eventosNuevos = @(Get-EventosCONTPAQiRecientes | Where-Object { $_.TimeCreated -ge $inicio } | Select-Object -First 8)
+        if ($eventosNuevos.Count -eq 0) {
+            Write-Log -Mensaje 'No se generaron errores nuevos de CONTPAQi/SQL en el Visor de eventos durante el proceso.' -Nivel OK
+        } else {
+            $advertencias += $eventosNuevos.Count
+            Write-Log -Mensaje "Windows registro $($eventosNuevos.Count) evento(s) relevante(s) durante la reparacion." -Nivel WARN
+            foreach ($evento in $eventosNuevos) {
+                $mensajeEvento = (($evento.Message -replace '[\r\n]+', ' ') -replace '\s+', ' ').Trim()
+                if ($mensajeEvento.Length -gt 220) { $mensajeEvento = $mensajeEvento.Substring(0, 220) + '...' }
+                Write-Log -Mensaje "$($evento.TimeCreated.ToString('HH:mm:ss')) | $($evento.ProviderName) | $mensajeEvento" -Nivel INFO
+            }
+        }
     } catch {
         $incidencias++
         Write-Log -Mensaje "Error inesperado durante la reparacion de terminal: $($_.Exception.Message)" -Nivel ERROR
     } finally {
-        Write-Log -Mensaje '[10/10] Restaurando el monitor ServicesDev...' -Nivel PROGRESS
+        Write-Log -Mensaje '[13/13] Restaurando y verificando el monitor ServicesDev...' -Nivel PROGRESS
         if (-not (Restore-ServicesDevAfterRepair -Estados $proteccionServicesDev.Estados)) { $incidencias++ }
     }
 
     $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
     Write-Host ''
-    $colorFinal = if ($incidencias -eq 0) { $Script:ColorExito } else { $Script:ColorAdvertencia }
+    $colorFinal = if ($incidencias -eq 0 -and $advertencias -eq 0) { $Script:ColorExito } else { $Script:ColorAdvertencia }
     Write-Separador -Color $colorFinal
-    if ($incidencias -eq 0) {
+    if ($incidencias -eq 0 -and $advertencias -eq 0) {
         Write-Linea -Texto ' REPARACION DE TERMINAL COMPLETADA Y VERIFICADA' -Color $colorFinal -Centrado
-        Write-Log -Mensaje "Terminal reparada en $duracion segundos con $advertencias advertencia(s) informativa(s)." -Nivel OK
+        Write-Log -Mensaje "Terminal reparada y validada sin incidencias en $duracion segundos." -Nivel OK
+    } elseif ($incidencias -eq 0) {
+        Write-Linea -Texto " REPARACION COMPLETADA CON $advertencias ADVERTENCIA(S)" -Color $colorFinal -Centrado
+        Write-Log -Mensaje "La reparacion termino en $duracion segundos; revisa las advertencias antes de validar CONTPAQi." -Nivel WARN
     } else {
         Write-Linea -Texto " REPARACION DE TERMINAL CON $incidencias INCIDENCIA(S)" -Color $colorFinal -Centrado
         Write-Log -Mensaje "Proceso terminado en $duracion segundos. Revisa las incidencias antes de abrir CONTPAQi." -Nivel WARN
     }
-    if (Test-ReinicioPendiente) { Write-Log -Mensaje 'Windows tiene un reinicio pendiente; reinicia la terminal antes de validar nuevamente.' -Nivel WARN }
-    else { Write-Log -Mensaje 'Abre CONTPAQi y valida acceso a empresas, licencias, ADD y timbrado desde esta terminal.' -Nivel INFO }
+    try {
+        $directorioEvidencia = Join-Path $env:ProgramData 'CONTPAQiToolbox\TerminalRepair'
+        if (-not (Test-Path -LiteralPath $directorioEvidencia -PathType Container)) {
+            New-Item -ItemType Directory -Path $directorioEvidencia -Force -ErrorAction Stop | Out-Null
+        }
+        $archivoEvidencia = Join-Path $directorioEvidencia ("Terminal_{0}_{1}.json" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        $serviciosEvidencia = @(Get-ServiciosReparacionTerminal | ForEach-Object {
+            [PSCustomObject]@{ Nombre = $_.Name; Visible = $_.DisplayName; Estado = $_.Status.ToString(); Inicio = $_.StartType.ToString() }
+        })
+        [PSCustomObject]@{
+            Equipo = $env:COMPUTERNAME; Inicio = $inicio; Fin = Get-Date; DuracionSegundos = $duracion
+            Incidencias = $incidencias; Advertencias = $advertencias; RespaldoACL = $archivoAcl
+            Servidor = if ($servidorValidado) { $servidorValidado.Host } else { $null }
+            Servicios = $serviciosEvidencia
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $archivoEvidencia -Encoding UTF8 -ErrorAction Stop
+        Write-Log -Mensaje "Evidencia tecnica guardada: $archivoEvidencia" -Nivel OK
+    } catch {
+        Write-Log -Mensaje "No se pudo guardar la evidencia tecnica: $($_.Exception.Message)" -Nivel WARN
+    }
+    $estadoReinicioTerminal = Write-EstadoReinicioPendiente
+    if (-not $estadoReinicioTerminal.Pendiente) { Write-Log -Mensaje 'Abre CONTPAQi y valida acceso a empresas, licencias, ADD y timbrado desde esta terminal.' -Nivel INFO }
 }
 
 # --- PROCESOS Y SESIONES ---
@@ -2220,8 +2286,140 @@ function Set-ContrasenaSQLSa {
     }
 }
 
+function Invoke-SetContrasenaSQLSaResponsive {
+    param(
+        [Parameter(Mandatory)][string]$Instancia,
+        [Parameter(Mandatory)][string]$NuevaContrasena
+    )
+    $codigo = @'
+param([string]$SqlInstance, [string]$NewPassword)
+$connection = New-Object System.Data.SqlClient.SqlConnection
+$command = $null
+try {
+    $connection.ConnectionString = "Server=$SqlInstance;Integrated Security=True;TrustServerCertificate=True;Connect Timeout=8;Application Name=CONTPAQi Toolbox"
+    $connection.Open()
+
+    function Get-SaStateInternal {
+        param([System.Data.SqlClient.SqlConnection]$SqlConnection)
+        $stateCommand = $SqlConnection.CreateCommand()
+        try {
+            $stateCommand.CommandTimeout = 10
+            $stateCommand.CommandText = @"
+SELECT CAST(is_disabled AS int),
+       CONVERT(datetime2, LOGINPROPERTY(N'sa', 'PasswordLastSetTime')),
+       CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS int)
+FROM sys.sql_logins WHERE name = N'sa';
+"@
+            $reader = $stateCommand.ExecuteReader()
+            try {
+                if (-not $reader.Read()) { throw "El login sa no existe en $SqlInstance." }
+                [PSCustomObject]@{
+                    Deshabilitado = ([int]$reader.GetValue(0) -eq 1)
+                    FechaPassword = if ($reader.IsDBNull(1)) { $null } else { [datetime]$reader.GetValue(1) }
+                    SoloWindows = ([int]$reader.GetValue(2) -eq 1)
+                }
+            } finally { $reader.Dispose() }
+        } finally { $stateCommand.Dispose() }
+    }
+
+    $before = Get-SaStateInternal -SqlConnection $connection
+    $command = $connection.CreateCommand()
+    $command.CommandTimeout = 15
+    $escapedPassword = $NewPassword.Replace("'", "''")
+    $command.CommandText = "ALTER LOGIN [sa] WITH PASSWORD = N'$escapedPassword'; ALTER LOGIN [sa] ENABLE;"
+    $null = $command.ExecuteNonQuery()
+    $after = Get-SaStateInternal -SqlConnection $connection
+    $fechaActualizada = ($null -ne $after.FechaPassword -and ($null -eq $before.FechaPassword -or $after.FechaPassword -gt $before.FechaPassword))
+    $loginHabilitado = -not $after.Deshabilitado
+
+    $autenticacionVerificada = $false
+    $detalleAutenticacion = ''
+    if ($after.SoloWindows) {
+        $detalleAutenticacion = 'La contraseña cambió, pero SQL Server está configurado únicamente para autenticación de Windows.'
+    } else {
+        $authConnection = New-Object System.Data.SqlClient.SqlConnection
+        try {
+            $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+            $builder.DataSource = $SqlInstance
+            $builder.InitialCatalog = 'master'
+            $builder.UserID = 'sa'
+            $builder.Password = $NewPassword
+            $builder.IntegratedSecurity = $false
+            $builder.TrustServerCertificate = $true
+            $builder.ConnectTimeout = 8
+            $builder.ApplicationName = 'CONTPAQi Toolbox Password Verification'
+            $authConnection.ConnectionString = $builder.ConnectionString
+            $authConnection.Open()
+            $verifyCommand = $authConnection.CreateCommand()
+            try {
+                $verifyCommand.CommandText = 'SELECT 1;'
+                $verifyCommand.CommandTimeout = 8
+                $autenticacionVerificada = ([int]$verifyCommand.ExecuteScalar() -eq 1)
+            } finally { $verifyCommand.Dispose() }
+        } catch {
+            $detalleAutenticacion = $_.Exception.Message
+        } finally { $authConnection.Dispose() }
+    }
+
+    $cambioVerificado = ($fechaActualizada -and $loginHabilitado)
+    $correcto = ($cambioVerificado -and ($after.SoloWindows -or $autenticacionVerificada))
+    $errorFinal = if (-not $fechaActualizada) {
+        'SQL ejecutó la instrucción, pero no confirmó una nueva fecha de contraseña.'
+    } elseif (-not $loginHabilitado) {
+        'La contraseña cambió, pero el login sa permanece deshabilitado.'
+    } elseif (-not $after.SoloWindows -and -not $autenticacionVerificada) {
+        "La contraseña cambió, pero la conexión de comprobación con sa falló: $detalleAutenticacion"
+    } else { $null }
+    [PSCustomObject]@{
+        Correcto = $correcto; CambioVerificado = $cambioVerificado
+        AutenticacionVerificada = $autenticacionVerificada; SoloWindows = $after.SoloWindows
+        FechaPassword = $after.FechaPassword; Detalle = $detalleAutenticacion; Error = $errorFinal
+    }
+} catch {
+    [PSCustomObject]@{
+        Correcto = $false; CambioVerificado = $false; AutenticacionVerificada = $false
+        SoloWindows = $false; FechaPassword = $null; Detalle = ''; Error = $_.Exception.Message
+    }
+} finally {
+    if ($command) { $command.Dispose() }
+    $connection.Dispose()
+}
+'@
+    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -Arguments @($Instancia, $NuevaContrasena) `
+        -TimeoutSeconds 35 -Activity "Restableciendo login sa en $Instancia"
+    if (-not $worker.Correcto -or $worker.Timeout -or -not $worker.Resultado) {
+        return [PSCustomObject]@{ Correcto = $false; Error = $(if ($worker.Error) { $worker.Error } else { 'SQL no devolvio un resultado valido.' }) }
+    }
+    return $worker.Resultado
+}
+
+function Write-SqlPasswordActivity {
+    param(
+        [Parameter(Mandatory)][System.Windows.Forms.RichTextBox]$ActivityBox,
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','PROGRESS','OK','WARN','ERROR')][string]$Level = 'INFO'
+    )
+    if ($ActivityBox.IsDisposed) { return }
+    $prefix = @{ INFO = '[INFO]'; PROGRESS = '[....]'; OK = '[ OK ]'; WARN = '[WARN]'; ERROR = '[FAIL]' }[$Level]
+    $color = switch ($Level) {
+        'OK'       { [Drawing.Color]::FromArgb(56, 224, 143) }
+        'WARN'     { [Drawing.Color]::FromArgb(255, 191, 71) }
+        'ERROR'    { [Drawing.Color]::FromArgb(255, 93, 115) }
+        'PROGRESS' { [Drawing.Color]::FromArgb(167, 139, 250) }
+        default    { [Drawing.Color]::FromArgb(148, 163, 184) }
+    }
+    $ActivityBox.SelectionStart = $ActivityBox.TextLength
+    $ActivityBox.SelectionLength = 0
+    $ActivityBox.SelectionColor = $color
+    $ActivityBox.AppendText("$(Get-Date -Format 'HH:mm:ss') $prefix $Message`r`n")
+    $ActivityBox.SelectionColor = $ActivityBox.ForeColor
+    $ActivityBox.SelectionStart = $ActivityBox.TextLength
+    $ActivityBox.ScrollToCaret()
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
 function Restablecer-ContrasenaSQL {
-    Write-Encabezado -Titulo 'RESTABLECER CONTRASENA SQL' -Subtitulo 'Login sa en instancias locales' -Color 'Green'
+    Write-Encabezado -Titulo 'CAMBIAR CONTRASENA SQL' -Subtitulo 'Login sa en instancias locales' -Color 'Green'
 
     # Usar exclusivamente servicios reales del motor. Leer el registro con
     # Get-Member tambien devuelve PSPath, PSParentPath y otras propiedades
@@ -2250,16 +2448,6 @@ function Restablecer-ContrasenaSQL {
         $Script:LogPanel.Controls.Add($sqlPanel)
         $sqlPanel.BringToFront()
         $Script:CurrentPanel = $sqlPanel
-
-        $titleLbl = New-Object System.Windows.Forms.Label
-        $titleLbl.Text = 'RESTABLECER CONTRASENA SA'
-        $titleLbl.Dock = 'Top'
-        $titleLbl.Height = 40
-        $titleLbl.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
-        $titleLbl.ForeColor = $Script:GUIColors.Success
-        $titleLbl.TextAlign = 'MiddleLeft'
-        $titleLbl.BackColor = [System.Drawing.Color]::Transparent
-        $sqlPanel.Controls.Add($titleLbl)
 
         $instPanel = New-Object System.Windows.Forms.GroupBox
         $instPanel.Text = ' Instancias SQL detectadas (selecciona las que deseas cambiar)'
@@ -2356,7 +2544,7 @@ function Restablecer-ContrasenaSQL {
         $sqlPanel.Controls.Add($btnPanel)
 
         $okBtn = New-Object System.Windows.Forms.Button
-        $okBtn.Text = 'Restablecer'
+        $okBtn.Text = 'Aplicar cambio'
         $okBtn.Size = New-Object System.Drawing.Size(140, 40)
         $okBtn.BackColor = $Script:GUIColors.Success
         $okBtn.ForeColor = $Script:GUIColors.BG
@@ -2378,56 +2566,124 @@ function Restablecer-ContrasenaSQL {
         Set-ModernButtonStyle -Button $cancelBtn
         $btnPanel.Controls.Add($cancelBtn)
 
-        $cleanup = {
-            if ($sqlPanel -and -not $sqlPanel.IsDisposed) { $sqlPanel.Dispose() }
-            if ($Script:CurrentPanel -eq $sqlPanel) { $Script:CurrentPanel = $null }
-            if ($Script:LogBox) {
-                $Script:LogBox.Visible = $true
-                $Script:LogBox.BringToFront()
-            }
-        }
+        $activityGroup = New-Object System.Windows.Forms.GroupBox
+        $activityGroup.Text = ' ACTIVIDAD SQL EN VIVO'
+        $activityGroup.Dock = 'Fill'
+        $activityGroup.MinimumSize = New-Object System.Drawing.Size(0, 150)
+        $activityGroup.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 10)
+        $activityGroup.ForeColor = $Script:GUIColors.Accent
+        $activityGroup.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $activityGroup.BackColor = [System.Drawing.Color]::Transparent
+        $sqlPanel.Controls.Add($activityGroup)
+        # En el orden de acoplamiento de WinForms, Fill debe quedar al frente en
+        # el Z-order para respetar el espacio consumido por los controles Top.
+        $activityGroup.BringToFront()
 
+        $activityBox = New-Object System.Windows.Forms.RichTextBox
+        $activityBox.Dock = 'Fill'
+        $activityBox.ReadOnly = $true
+        $activityBox.BackColor = [System.Drawing.Color]::FromArgb(2, 3, 4)
+        $activityBox.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
+        $activityBox.BorderStyle = 'FixedSingle'
+        $activityBox.Font = New-Object System.Drawing.Font('Consolas', 9)
+        $activityBox.WordWrap = $true
+        $activityBox.ScrollBars = 'Vertical'
+        $activityBox.DetectUrls = $false
+        $activityGroup.Controls.Add($activityBox)
+        Write-SqlPasswordActivity -ActivityBox $activityBox -Message 'Consola preparada. La contraseña nunca se mostrará en esta actividad.' -Level INFO
+        Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Instancias disponibles: $($nombresInstancias -join ', ')" -Level INFO
+
+        # El cierre de vistas se centraliza para no intentar ejecutar una
+        # variable local que ya dejo de existir cuando ocurre el clic.
         $cancelBtn.Add_Click({
-            & $cleanup
+            Close-CurrentPanel
             Write-Log -Mensaje 'Operacion cancelada.' -Nivel WARN
         })
 
+        # Guardar el estado en el propio boton evita depender del alcance tardio
+        # de variables locales en los eventos de Windows Forms.
+        $formState = [PSCustomObject]@{
+            PasswordBox = $passBox
+            ConfirmBox = $passConfirmBox
+            Instances = @($chkInstances)
+            ActivityBox = $activityBox
+            CancelButton = $cancelBtn
+        }
+        # Set-ModernButtonStyle utiliza Tag para Base/Hover/Active. Agregar el
+        # estado como una propiedad conserva esos colores y evita valores NULL.
+        $okBtn.Tag | Add-Member -NotePropertyName FormState -NotePropertyValue $formState -Force
         $okBtn.Add_Click({
-            $passInput = $passBox.Text
-            if ([string]::IsNullOrWhiteSpace($passInput) -or $passInput.Length -lt 8) {
+            param($sender, $eventArgs)
+            $formState = $sender.Tag.FormState
+            $activityBox = $formState.ActivityBox
+            $passInput = [string]$formState.PasswordBox.Text
+            if ($formState.PasswordBox.TextLength -lt 8) {
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message 'Validación detenida: la contraseña contiene menos de 8 caracteres.' -Level WARN
                 [System.Windows.Forms.MessageBox]::Show('La contraseña debe tener al menos 8 caracteres.', 'Contraseña no válida', 'OK', 'Warning') | Out-Null
                 return
             }
-            if ($passInput -cne $passConfirmBox.Text) {
+            if ($passInput -cne [string]$formState.ConfirmBox.Text) {
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message 'Validación detenida: las contraseñas no coinciden.' -Level WARN
                 [System.Windows.Forms.MessageBox]::Show('Las contraseñas no coinciden.', 'Confirmación no válida', 'OK', 'Warning') | Out-Null
                 return
             }
 
             $seleccionadas = @()
-            foreach ($item in $chkInstances) {
+            foreach ($item in @($formState.Instances)) {
                 if ($item.CheckBox.Checked) { $seleccionadas += $item.Nombre }
             }
             if ($seleccionadas.Count -eq 0) {
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message 'Validación detenida: no hay instancias seleccionadas.' -Level WARN
                 [System.Windows.Forms.MessageBox]::Show('Selecciona al menos una instancia.', 'Sin instancias', 'OK', 'Warning') | Out-Null
                 return
             }
-            if (-not (Confirmar-Movimiento -Frase 'CAMBIAR CONTRASENA' `
+            if (-not (Confirmar-Movimiento -Frase 'CAMBIAR' `
                 -Accion "Cambiar la contrasena sa en $($seleccionadas.Count) instancia(s)" `
-                -Detalle 'Las aplicaciones que utilicen la contrasena anterior deberan actualizar su configuracion.')) { return }
-
-            & $cleanup
-
-            foreach ($inst in $seleccionadas) {
-                $serverName = if ($inst -eq 'MSSQLSERVER') { '.' } else { ".\$inst" }
-                Write-Log -Mensaje "Conectando a $serverName ..." -Nivel PROGRESS
-                try {
-                    Set-ContrasenaSQLSa -Instancia $serverName -NuevaContrasena $passInput
-                    Write-Log -Mensaje "Contrasena 'sa' restablecida en $serverName" -Nivel OK
-                } catch {
-                    Write-Log -Mensaje "Error en $($serverName): $($_.Exception.Message)" -Nivel ERROR
-                }
+                -Detalle 'Las aplicaciones que utilicen la contrasena anterior deberan actualizar su configuracion.')) {
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message 'Operación cancelada en la confirmación de seguridad.' -Level WARN
+                return
             }
-            $passInput = $null
+
+            $sender.Enabled = $false
+            $formState.CancelButton.Enabled = $false
+            $formState.PasswordBox.Enabled = $false
+            $formState.ConfirmBox.Enabled = $false
+            $correctas = 0
+            $fallidas = 0
+            try {
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Iniciando cambio y verificación en $($seleccionadas.Count) instancia(s)." -Level PROGRESS
+                foreach ($inst in $seleccionadas) {
+                    $serverName = if ($inst -eq 'MSSQLSERVER') { '.' } else { ".\$inst" }
+                    Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Conectando con $serverName mediante autenticación integrada..." -Level PROGRESS
+                    $resultadoCambio = Invoke-SetContrasenaSQLSaResponsive -Instancia $serverName -NuevaContrasena $passInput
+                    if ($resultadoCambio.Correcto) {
+                        $correctas++
+                        if ($resultadoCambio.AutenticacionVerificada) {
+                            Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Cambio validado: conexión real con 'sa' y la nueva contraseña correcta en $serverName." -Level OK
+                        } else {
+                            Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Cambio confirmado por SQL y login 'sa' habilitado. La instancia usa solo autenticación de Windows, por lo que no admite probar el acceso SQL." -Level WARN
+                        }
+                        Write-Log -Mensaje "Contrasena 'sa' cambiada y verificada en $serverName" -Nivel OK
+                    } else {
+                        $fallidas++
+                        $detalleError = if ($resultadoCambio.Error) { [string]$resultadoCambio.Error } else { 'SQL no devolvió detalles.' }
+                        $nivelFallo = if ($resultadoCambio.CambioVerificado) { 'WARN' } else { 'ERROR' }
+                        Write-SqlPasswordActivity -ActivityBox $activityBox -Message "$serverName no superó toda la validación: $detalleError" -Level $nivelFallo
+                        Write-Log -Mensaje "Error en $($serverName): $detalleError" -Nivel ERROR
+                    }
+                }
+                $nivelResumen = if ($fallidas -eq 0) { 'OK' } elseif ($correctas -gt 0) { 'WARN' } else { 'ERROR' }
+                Write-SqlPasswordActivity -ActivityBox $activityBox -Message "Proceso finalizado: $correctas correcta(s), $fallidas fallida(s)." -Level $nivelResumen
+            } finally {
+                $passInput = $null
+                $formState.PasswordBox.Clear()
+                $formState.ConfirmBox.Clear()
+                $formState.PasswordBox.Enabled = $true
+                $formState.ConfirmBox.Enabled = $true
+                $formState.CancelButton.Enabled = $true
+                $sender.Enabled = $true
+                $formState.PasswordBox.Focus()
+            }
         })
 
         $passBox.Focus() | Out-Null
@@ -2445,7 +2701,7 @@ function Restablecer-ContrasenaSQL {
             Write-Log -Mensaje 'Las contrasenas no coinciden.' -Nivel ERROR
             return
         }
-        if (-not (Confirmar-Movimiento -Frase 'CAMBIAR CONTRASENA' `
+        if (-not (Confirmar-Movimiento -Frase 'CAMBIAR' `
             -Accion "Cambiar la contrasena sa en $($nombresInstancias.Count) instancia(s)" `
             -Detalle 'Las aplicaciones que utilicen la contrasena anterior deberan actualizar su configuracion.')) { return }
 
@@ -3984,7 +4240,7 @@ function Ejecutar-SuperReset {
             Write-Log -Mensaje "Espacio libre en $env:SystemDrive $libreGB GB." -Nivel $(if ($libreGB -ge 10) { 'OK' } else { 'WARN' })
             if ($libreGB -lt 2) { $incidencias++ }
         }
-        if (Test-ReinicioPendiente) { Write-Log -Mensaje 'Windows ya tenia un reinicio pendiente antes de iniciar.' -Nivel WARN }
+        $null = Write-EstadoReinicioPendiente -SoloSiExiste
 
         Write-Log -Mensaje '[2/14] Cerrando procesos CONTPAQi/PID de todas las sesiones...' -Nivel PROGRESS
         foreach ($proceso in $procesos) {
@@ -4046,7 +4302,7 @@ function Ejecutar-SuperReset {
             Write-Log -Mensaje "Winsock no pudo restablecerse: $($winsock.Error) (codigo $($winsock.ExitCode))." -Nivel ERROR
         }
 
-        Write-Log -Mensaje '[7/14] Recuperando dependencias de Windows y CONTPAQi...' -Nivel PROGRESS
+        Write-Log -Mensaje '[7/14] Recuperando dependencias y aplicando permisos/Excel oficiales...' -Nivel PROGRESS
         $dependencias = @('RpcSs', 'DcomLaunch', 'RpcEptMapper', 'Dnscache', 'LanmanWorkstation', 'W32Time', 'MSMQ')
         foreach ($nombre in $dependencias) {
             $servicio = Get-Service -Name $nombre -ErrorAction SilentlyContinue
@@ -4065,14 +4321,23 @@ function Ejecutar-SuperReset {
             }
             Write-Log -Mensaje "Dependencia $nombre activa." -Nivel OK
         }
+        $permisosServidor = Invoke-RepararPermisosTerminalCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+        if (-not $permisosServidor.Correcto) { $incidencias += [math]::Max(1, [int]$permisosServidor.Fallidos) }
+        $excelServidor = Invoke-ConfigurarCentroConfianzaExcelCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+        if (-not $excelServidor.Correcto) { $incidencias += [math]::Max(1, [int]$excelServidor.Fallidos) }
 
         Write-Log -Mensaje '[8/14] Iniciando SQL con reintentos y orden de dependencias...' -Nivel PROGRESS
         $sqlStartOrder = @($serviciosSql | Sort-Object { if ($_ -like 'MSSQL*') { 0 } elseif ($_ -eq 'SQLBrowser') { 1 } else { 2 } })
         foreach ($nombre in $sqlStartOrder) {
             if (Test-ServicioDeshabilitado -Nombre $nombre) {
-                Write-Log -Mensaje "SQL $nombre esta deshabilitado; se conserva su configuracion." -Nivel WARN
-                if ($nombre -like 'MSSQL*') { $incidencias++ }
-                continue
+                try {
+                    Set-Service -Name $nombre -StartupType Manual -ErrorAction Stop
+                    Write-Log -Mensaje "SQL $nombre estaba deshabilitado; se restablecio a inicio Manual para repararlo." -Nivel WARN
+                } catch {
+                    $incidencias++
+                    Write-Log -Mensaje "SQL $nombre sigue deshabilitado y no pudo recuperarse: $($_.Exception.Message)" -Nivel ERROR
+                    continue
+                }
             }
             $iniciado = $false
             $ultimoError = ''
@@ -4096,7 +4361,7 @@ function Ejecutar-SuperReset {
         }
 
         Write-Log -Mensaje '[10/14] Iniciando y auditando todos los servicios CONTPAQi...' -Nivel PROGRESS
-        $resultadoApp = Start-TodosServiciosCONTPAQiVerificado -Intentos 2
+        $resultadoApp = Start-TodosServiciosCONTPAQiVerificado -Intentos 3 -RecuperarDeshabilitados
         $incidencias += $resultadoApp.Fallidos
         Write-Log -Mensaje "CONTPAQi: $($resultadoApp.Correctos) activos, $($resultadoApp.Fallidos) con incidencia, $($resultadoApp.Omitidos) deshabilitados de $($resultadoApp.Total)." -Nivel $(if ($resultadoApp.Fallidos -eq 0) { 'OK' } else { 'WARN' })
 
@@ -4237,18 +4502,112 @@ foreach ($elemento in @(Get-ChildItem -LiteralPath $Directorio -Force -ErrorActi
     return [int]$resultado.Eliminados
 }
 
-function Test-ReinicioPendiente {
-    $rutas = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    )
-    foreach ($ruta in $rutas) {
-        if (Test-Path -LiteralPath $ruta) { return $true }
+function ConvertTo-RutaReinicioLegible {
+    param([AllowEmptyString()][string]$Ruta)
+    if ([string]::IsNullOrWhiteSpace($Ruta)) { return '' }
+    $valor = $Ruta.Trim()
+    if ($valor -match '(?i)([A-Z]:\\.*)$') { return $matches[1] }
+    return ($valor -replace '^[*!0-9]*\\\?\?\\', '')
+}
+
+function Get-EstadoReinicioPendiente {
+    $razonesConfirmadas = New-Object System.Collections.ArrayList
+    $operacionesResiduales = New-Object System.Collections.ArrayList
+
+    function Add-RazonReinicio {
+        param([string]$Fuente, [string]$Detalle, [string]$Accion)
+        [void]$razonesConfirmadas.Add([PSCustomObject]@{
+            Fuente = $Fuente; Detalle = $Detalle; Accion = $Accion
+        })
+    }
+
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        Add-RazonReinicio -Fuente 'Mantenimiento de componentes (CBS)' `
+            -Detalle 'Windows termino de instalar o reparar componentes y dejo la marca RebootPending.' `
+            -Accion 'Reinicia Windows. Si la marca continua, ejecuta DISM RestoreHealth y revisa CBS.log.'
+    }
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        Add-RazonReinicio -Fuente 'Windows Update' `
+            -Detalle 'Windows Update registra RebootRequired, aunque la pantalla de actualizaciones no muestre descargas pendientes.' `
+            -Accion 'Reinicia y abre Windows Update para buscar nuevamente. Si persiste, revisa el historial y los servicios de actualizacion.'
     }
     try {
-        $valor = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-        return ($null -ne $valor)
-    } catch { return $false }
+        $updateExe = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Updates' -Name UpdateExeVolatile -ErrorAction SilentlyContinue).UpdateExeVolatile
+        if ($null -ne $updateExe -and [int]$updateExe -ne 0) {
+            Add-RazonReinicio -Fuente 'Instalador de Windows' `
+                -Detalle "UpdateExeVolatile conserva el valor $updateExe despues de una instalacion." `
+                -Accion 'Termina o repara el instalador que genero la marca y reinicia una vez.'
+        }
+    } catch { }
+    try {
+        $nombreActivo = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+        $nombreConfigurado = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+        if ($nombreActivo -and $nombreConfigurado -and $nombreActivo -ne $nombreConfigurado) {
+            Add-RazonReinicio -Fuente 'Cambio de nombre del equipo' `
+                -Detalle "Nombre activo: $nombreActivo | Nombre configurado: $nombreConfigurado." `
+                -Accion 'Reinicia para aplicar el nuevo nombre del equipo y valida dominio, recursos compartidos y SQL.'
+        }
+    } catch { }
+
+    # PendingFileRenameOperations es una pista debil: navegadores, antivirus y
+    # Gaming Services pueden recrearla o dejar residuos despues de reiniciar.
+    # Por si sola no debe afirmar que Windows necesita otro reinicio.
+    foreach ($nombreValor in @('PendingFileRenameOperations', 'PendingFileRenameOperations2')) {
+        try {
+            $entradas = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name $nombreValor -ErrorAction SilentlyContinue).$nombreValor)
+            for ($indice = 0; $indice -lt $entradas.Count; $indice += 2) {
+                $origen = ConvertTo-RutaReinicioLegible -Ruta ([string]$entradas[$indice])
+                $destino = if (($indice + 1) -lt $entradas.Count) { ConvertTo-RutaReinicioLegible -Ruta ([string]$entradas[$indice + 1]) } else { '' }
+                if (-not $origen -and -not $destino) { continue }
+                $texto = if ($destino) { "$origen -> $destino" } else { "$origen (eliminacion pendiente)" }
+                $responsable = if ($texto -match '(?i)Google\\Chrome|Chrome\\Temp') { 'Google Chrome' }
+                    elseif ($texto -match '(?i)Microsoft\\Edge|EdgeUpdate') { 'Microsoft Edge' }
+                    elseif ($texto -match '(?i)gamingservices|Xbox') { 'Gaming Services / Xbox' }
+                    elseif ($texto -match '(?i)\\Temp\\') { 'Instalador o carpeta temporal' }
+                    elseif ($texto -match '(?i)CONTPAQ|COMPAC') { 'CONTPAQi / Compac' }
+                    else { 'Aplicacion no identificada' }
+                [void]$operacionesResiduales.Add([PSCustomObject]@{
+                    Fuente = $nombreValor; Responsable = $responsable; Detalle = $texto
+                })
+            }
+        } catch { }
+    }
+
+    $confirmado = ($razonesConfirmadas.Count -gt 0)
+    $residual = ($operacionesResiduales.Count -gt 0)
+    $estado = if ($confirmado) { 'CONFIRMADO' } elseif ($residual) { 'NO CONFIRMADO - SENAL RESIDUAL' } else { 'NO' }
+    $accionResidual = if ($residual) {
+        'No reinicies repetidamente solo por esta señal. Actualiza o repara la aplicacion responsable. Si las rutas ya no existen y la marca persiste, un tecnico puede exportar la clave Session Manager y retirar unicamente los pares obsoletos.'
+    } else { '' }
+    return [PSCustomObject]@{
+        Pendiente = $confirmado
+        Estado = $estado
+        Razones = @($razonesConfirmadas)
+        OperacionesResiduales = @($operacionesResiduales)
+        AccionResidual = $accionResidual
+    }
+}
+
+
+function Write-EstadoReinicioPendiente {
+    param([switch]$SoloSiExiste)
+    $estado = Get-EstadoReinicioPendiente
+    if ($estado.Pendiente) {
+        Write-Log -Mensaje "Reinicio pendiente CONFIRMADO por $($estado.Razones.Count) fuente(s)." -Nivel WARN
+        foreach ($razon in $estado.Razones) {
+            Write-Log -Mensaje "$($razon.Fuente): $($razon.Detalle)" -Nivel WARN
+            Write-Log -Mensaje "Accion: $($razon.Accion)" -Nivel INFO
+        }
+    } elseif ($estado.OperacionesResiduales.Count -gt 0) {
+        Write-Log -Mensaje 'No existe un reinicio confirmado. Windows conserva operaciones de archivo residuales que no justifican reiniciar por si solas.' -Nivel INFO
+        foreach ($operacion in @($estado.OperacionesResiduales | Select-Object -First 6)) {
+            Write-Log -Mensaje "$($operacion.Responsable): $($operacion.Detalle)" -Nivel INFO
+        }
+        Write-Log -Mensaje "Accion: $($estado.AccionResidual)" -Nivel INFO
+    } elseif (-not $SoloSiExiste) {
+        Write-Log -Mensaje 'Windows no reporta un reinicio pendiente.' -Nivel OK
+    }
+    return $estado
 }
 
 function Invoke-ReparacionProfundaCONTPAQi {
@@ -4317,7 +4676,7 @@ function Invoke-ReparacionProfundaCONTPAQi {
         }
     }
 
-    Write-Log -Mensaje '[5/8] Limpiando temporales seguros y cache DNS...' -Nivel PROGRESS
+    Write-Log -Mensaje '[5/8] Limpiando temporales, DNS y reparando permisos/Excel...' -Nivel PROGRESS
     $temporales = @(
         $env:TEMP,
         (Join-Path $env:LOCALAPPDATA 'Temp\Compac'),
@@ -4335,13 +4694,23 @@ function Invoke-ReparacionProfundaCONTPAQi {
         $errores++
         Write-Log -Mensaje "Temporales eliminados: $totalEliminados | No fue posible renovar la cache DNS: $($resultadoDns.Error)" -Nivel WARN
     }
+    $permisosProfundos = Invoke-RepararPermisosTerminalCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+    if (-not $permisosProfundos.Correcto) { $errores += [math]::Max(1, [int]$permisosProfundos.Fallidos) }
+    $excelProfundo = Invoke-ConfigurarCentroConfianzaExcelCONTPAQi -ConfirmacionOmitida -ModoIntegrado
+    if (-not $excelProfundo.Correcto) { $errores += [math]::Max(1, [int]$excelProfundo.Fallidos) }
 
     Write-Log -Mensaje '[6/8] Iniciando SQL en orden...' -Nivel PROGRESS
     $sqlStartOrder = @($serviciosSqlDetectados | Sort-Object { if ($_ -like 'MSSQL*') { 0 } elseif ($_ -eq 'SQLBrowser') { 1 } else { 2 } })
     foreach ($nombre in $sqlStartOrder) {
         if (Test-ServicioDeshabilitado -Nombre $nombre) {
-            Write-Log -Mensaje "SQL $nombre esta deshabilitado; se conserva su configuracion." -Nivel WARN
-            continue
+            try {
+                Set-Service -Name $nombre -StartupType Manual -ErrorAction Stop
+                Write-Log -Mensaje "SQL $nombre estaba deshabilitado; se restablecio a inicio Manual para repararlo." -Nivel WARN
+            } catch {
+                $errores++
+                Write-Log -Mensaje "SQL $nombre sigue deshabilitado y no pudo recuperarse: $($_.Exception.Message)" -Nivel ERROR
+                continue
+            }
         }
         $resultadoSqlStart = Invoke-ServiceActionResponsive -Nombre $nombre -Accion Start -TimeoutSegundos 120
         if ($resultadoSqlStart.Correcto) {
@@ -4353,7 +4722,7 @@ function Invoke-ReparacionProfundaCONTPAQi {
     }
 
     Write-Log -Mensaje '[7/8] Iniciando y verificando todos los servicios CONTPAQi...' -Nivel PROGRESS
-    $resultadoServicios = Start-TodosServiciosCONTPAQiVerificado
+    $resultadoServicios = Start-TodosServiciosCONTPAQiVerificado -Intentos 3 -RecuperarDeshabilitados
     $errores += $resultadoServicios.Fallidos
     Write-Log -Mensaje "Auditoria CONTPAQi: $($resultadoServicios.Correctos) activos, $($resultadoServicios.Fallidos) con incidencia, $($resultadoServicios.Omitidos) deshabilitados de $($resultadoServicios.Total) detectados." -Nivel $(if ($resultadoServicios.Fallidos -eq 0) { 'OK' } else { 'WARN' })
 
@@ -4384,74 +4753,12 @@ function Invoke-ReparacionProfundaCONTPAQi {
     } else {
         Write-Log -Mensaje "Reparacion completada con $errores incidencia(s) en $duracion segundos. Revisa la bitacora." -Nivel WARN
     }
-    if (Test-ReinicioPendiente) {
-        Write-Log -Mensaje 'Windows tiene un reinicio pendiente. Reinicia el equipo antes de validar nuevamente CONTPAQi.' -Nivel WARN
-    } else {
+    $estadoReinicioFinal = Write-EstadoReinicioPendiente
+    if (-not $estadoReinicioFinal.Pendiente) {
         Write-Log -Mensaje 'Abre CONTPAQi y valida acceso a empresa, ADD, timbrado y terminales.' -Nivel INFO
     }
 }
 
-function Show-DiagnosticoCompleto {
-    Write-Encabezado -Titulo 'DIAGNOSTICO COMPLETO' -Subtitulo 'Servicios, procesos y sesiones' -Color 'Cyan'
-
-    Write-SeccionMenu -Titulo 'SQL SERVER' -Color 'Green'
-    if ($ServiciosSQL.Count -eq 0) {
-        Write-Log -Mensaje 'Sin instancias SQL detectadas.' -Nivel INFO
-    } else {
-        foreach ($svc in $ServiciosSQL) {
-            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-            $color = if ($s.Status -eq 'Running') { $Script:ColorExito } else { $Script:ColorError }
-            Write-Host "  $svc : $(Get-EstadoTexto -Servicio $s)" -ForegroundColor $color
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'SERVICIOS TERMINAL (AuthServer)' -Color $Script:ColorTerminal
-    $terminal = @(Get-ServiciosTerminal)
-    if ($terminal.Count -eq 0) {
-        Write-Log -Mensaje 'Sin AuthServer/Licencias detectados.' -Nivel INFO
-    } else {
-        foreach ($item in $terminal) {
-            $color = if ($item.Servicio.Status -eq 'Running') { $Script:ColorExito } else { $Script:ColorError }
-            Write-Host "  $($item.Etiqueta)" -ForegroundColor $Script:ColorAcento
-            Write-Host "    -> $(Get-EstadoTexto -Servicio $item.Servicio) | $($item.Servicio.Name)" -ForegroundColor $color
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'SESIONES RDP' -Color $Script:ColorServidor
-    $sesiones = @(Get-SesionesActivas)
-    if ($sesiones.Count -eq 0) {
-        Write-Log -Mensaje 'Sin sesiones RDP activas.' -Nivel INFO
-    } else {
-        foreach ($ses in $sesiones) {
-            Write-Log -Mensaje "$($ses.Usuario) | ID $($ses.SessionId) | $($ses.Estado)" -Nivel INFO
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'PROCESOS CONTPAQi' -Color $Script:ColorAdvertencia
-    $procesos = @(Get-ProcesosCONTPAQi | Where-Object { -not $_.EsToolbox })
-    if ($procesos.Count -eq 0) {
-        Write-Log -Mensaje 'Sin procesos CONTPAQi activos.' -Nivel OK
-    } else {
-        foreach ($p in $procesos) {
-            Write-Log -Mensaje "PID $($p.PID) | $($p.Nombre.PadRight(16)) | Modulo: $($p.Modulo.PadRight(24)) | $($p.Usuario)" -Nivel PROGRESS
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'PROCESOS Y SERVICIOS PID' -Color $Script:ColorServidor
-    $procesosPID = @(Get-ProcesosPID | Where-Object { -not $_.EsToolbox })
-    if ($procesosPID.Count -eq 0) {
-        Write-Log -Mensaje 'Sin procesos PID activos.' -Nivel OK
-    } else {
-        foreach ($p in $procesosPID) {
-            Write-Log -Mensaje "PID $($p.PID) | $($p.Nombre.PadRight(18)) | Modulo: $($p.Modulo.PadRight(24)) | $($p.Usuario)" -Nivel PROGRESS
-        }
-    }
-    $serviciosPID = @(Get-ServiciosPID)
-    foreach ($svc in $serviciosPID) {
-        $color = if ($svc.Status -eq 'Running') { $Script:ColorExito } else { $Script:ColorError }
-        Write-Host "  $($svc.DisplayName) -> $(Get-EstadoTexto -Servicio $svc)" -ForegroundColor $color
-    }
-}
 
 # --- DIAGNOSTICO SEGURO PARA TICKETS ---
 # Solo recopila evidencia y recomendaciones. No modifica empresas, bases de datos
@@ -4472,136 +4779,320 @@ function Get-RutasCONTPAQi {
 
 function Get-RutasPermisosTerminalCONTPAQi {
     $candidatas = @(
-        [PSCustomObject]@{ Ruta = 'C:\Compac'; Derecho = 'Modify'; Tipo = 'Datos y operacion heredada' },
-        [PSCustomObject]@{ Ruta = 'C:\CONTPAQi'; Derecho = 'Modify'; Tipo = 'Datos y operacion heredada' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramData 'Compac'); Derecho = 'Modify'; Tipo = 'Datos compartidos locales' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramData 'CONTPAQi'); Derecho = 'Modify'; Tipo = 'Datos compartidos locales' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:PUBLIC 'Documents\Compac'); Derecho = 'Modify'; Tipo = 'Documentos publicos' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:PUBLIC 'Documents\CONTPAQi'); Derecho = 'Modify'; Tipo = 'Documentos publicos' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:LOCALAPPDATA 'Compac'); Derecho = 'Modify'; Tipo = 'Configuracion del usuario' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:LOCALAPPDATA 'CONTPAQi'); Derecho = 'Modify'; Tipo = 'Configuracion del usuario' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:APPDATA 'Compac'); Derecho = 'Modify'; Tipo = 'Configuracion del usuario' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:APPDATA 'CONTPAQi'); Derecho = 'Modify'; Tipo = 'Configuracion del usuario' },
-        [PSCustomObject]@{ Ruta = (Join-Path ${env:ProgramFiles(x86)} 'Compac'); Derecho = 'ReadAndExecute'; Tipo = 'Archivos de programa protegidos' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramFiles 'Compac'); Derecho = 'ReadAndExecute'; Tipo = 'Archivos de programa protegidos' },
-        [PSCustomObject]@{ Ruta = (Join-Path ${env:ProgramFiles(x86)} 'CONTPAQi'); Derecho = 'ReadAndExecute'; Tipo = 'Archivos de programa protegidos' },
-        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramFiles 'CONTPAQi'); Derecho = 'ReadAndExecute'; Tipo = 'Archivos de programa protegidos' }
-    ) | Where-Object { $_.Ruta -and (Test-Path -LiteralPath $_.Ruta -PathType Container) }
+        [PSCustomObject]@{ Ruta = 'C:\Compac'; Tipo = 'Carpeta oficial de datos' },
+        [PSCustomObject]@{ Ruta = 'C:\Compacw'; Tipo = 'Carpeta oficial heredada' },
+        [PSCustomObject]@{ Ruta = 'C:\CONTPAQi'; Tipo = 'Carpeta de datos' },
+        [PSCustomObject]@{ Ruta = (Join-Path ${env:ProgramFiles(x86)} 'Compac'); Tipo = 'Archivos de programa oficiales' },
+        [PSCustomObject]@{ Ruta = (Join-Path ${env:ProgramFiles(x86)} 'Compacw'); Tipo = 'Archivos de programa heredados' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramFiles 'Compac'); Tipo = 'Archivos de programa' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramFiles 'CONTPAQi'); Tipo = 'Archivos de programa' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramData 'Compac'); Tipo = 'Datos compartidos locales' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:ProgramData 'CONTPAQi'); Tipo = 'Datos compartidos locales' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:PUBLIC 'Documents\Compac'); Tipo = 'Documentos publicos' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:PUBLIC 'Documents\CONTPAQi'); Tipo = 'Documentos publicos' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:LOCALAPPDATA 'Compac'); Tipo = 'Configuracion del usuario' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:LOCALAPPDATA 'CONTPAQi'); Tipo = 'Configuracion del usuario' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:APPDATA 'Compac'); Tipo = 'Configuracion del usuario' },
+        [PSCustomObject]@{ Ruta = (Join-Path $env:APPDATA 'CONTPAQi'); Tipo = 'Configuracion del usuario' }
+    ) | Where-Object { $_.Ruta -and (Test-Path -LiteralPath $_.Ruta -PathType Container) } | ForEach-Object {
+        [PSCustomObject]@{ Ruta = $_.Ruta; Derecho = 'FullControl'; Tipo = $_.Tipo; TipoObjeto = 'Directory' }
+    }
+
+    $raicesAccesos = @(
+        [Environment]::GetFolderPath('CommonDesktopDirectory'),
+        [Environment]::GetFolderPath('DesktopDirectory'),
+        [Environment]::GetFolderPath('CommonStartMenu'),
+        [Environment]::GetFolderPath('StartMenu')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+    foreach ($raizAcceso in $raicesAccesos) {
+        foreach ($acceso in @(Get-ChildItem -LiteralPath $raizAcceso -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)CONTPAQ|COMPAC' })) {
+            $candidatas += [PSCustomObject]@{
+                Ruta = $acceso.FullName; Derecho = 'FullControl'; Tipo = 'Acceso directo CONTPAQi'; TipoObjeto = 'File'
+            }
+        }
+    }
 
     $unicas = @{}
     foreach ($item in $candidatas) {
         $rutaCompleta = [IO.Path]::GetFullPath($item.Ruta).TrimEnd('\')
         $clave = $rutaCompleta.ToLowerInvariant()
-        if (-not $unicas.ContainsKey($clave) -or $item.Derecho -eq 'Modify') {
-            $unicas[$clave] = [PSCustomObject]@{ Ruta = $rutaCompleta; Derecho = $item.Derecho; Tipo = $item.Tipo }
+        if (-not $unicas.ContainsKey($clave)) {
+            $unicas[$clave] = [PSCustomObject]@{
+                Ruta = $rutaCompleta; Derecho = 'FullControl'; Tipo = $item.Tipo
+                TipoObjeto = $(if ($item.TipoObjeto) { $item.TipoObjeto } else { 'Directory' })
+            }
         }
     }
     return @($unicas.Values | Sort-Object Ruta)
 }
 
+function Get-ClavesRegistroCONTPAQi {
+    $bases = @('HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\WOW6432Node', 'HKCU:\Software')
+    $claves = New-Object System.Collections.Generic.List[object]
+    foreach ($base in $bases) {
+        if (-not (Test-Path -LiteralPath $base)) { continue }
+        foreach ($clave in @(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | Where-Object {
+            $_.PSChildName -match '(?i)computaci[oó]n en acci[oó]n|compac|contpaqi'
+        })) {
+            $claves.Add([PSCustomObject]@{ Ruta = ("Registry::{0}" -f $clave.Name); Visible = $clave.Name })
+        }
+    }
+    return @($claves | Sort-Object Ruta -Unique)
+}
+
 function Test-PermisoUsuariosCONTPAQi {
     param(
         [Parameter(Mandatory)][string]$Ruta,
-        [Parameter(Mandatory)][ValidateSet('Modify', 'ReadAndExecute')][string]$Derecho
+        [Parameter(Mandatory)][ValidateSet('Modify', 'ReadAndExecute', 'FullControl')][string]$Derecho
     )
     try {
-        $sidUsuarios = 'S-1-5-32-545'
+        $sidsRequeridos = @('S-1-1-0','S-1-5-32-544','S-1-5-32-545','S-1-5-11','S-1-5-13','S-1-5-18','S-1-3-0')
+        try {
+            $sidAdministrador = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
+                Where-Object { $_.SID -match '-500$' } | Select-Object -First 1 -ExpandProperty SID
+            if ($sidAdministrador) { $sidsRequeridos += [string]$sidAdministrador }
+        } catch { }
+        $sidsRequeridos = @($sidsRequeridos | Select-Object -Unique)
         $requerido = [Security.AccessControl.FileSystemRights][Enum]::Parse([Security.AccessControl.FileSystemRights], $Derecho)
         $reglas = @(Get-Acl -LiteralPath $Ruta -ErrorAction Stop | Select-Object -ExpandProperty Access)
-        $permitido = $false
+        $permitidos = @{}
         foreach ($regla in $reglas) {
             try { $sid = $regla.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
-            if ($sid -ne $sidUsuarios) { continue }
+            if ($sid -notin $sidsRequeridos) { continue }
             $incluye = (($regla.FileSystemRights -band $requerido) -eq $requerido)
             if ($incluye -and $regla.AccessControlType -eq 'Deny') { return $false }
-            if ($incluye -and $regla.AccessControlType -eq 'Allow') { $permitido = $true }
+            if ($incluye -and $regla.AccessControlType -eq 'Allow') { $permitidos[$sid] = $true }
         }
-        return $permitido
+        return (@($sidsRequeridos | Where-Object { -not $permitidos.ContainsKey($_) }).Count -eq 0)
     } catch {
         return $false
     }
 }
 
 function Invoke-RepararPermisosTerminalCONTPAQi {
-    Write-Encabezado -Titulo 'PERMISOS CONTPAQI PARA TERMINALES' -Subtitulo 'Acceso local seguro para usuarios estandar' -Color $Script:ColorTerminal
-    Write-Log -Mensaje 'Se concedera Modificar solo en datos/configuracion y Lectura-Ejecucion en archivos de programa. No se otorgara Control total.' -Nivel INFO
-    if (-not (Confirmar-Movimiento -Frase 'APLICAR PERMISOS' `
+    param(
+        [switch]$ConfirmacionOmitida,
+        [switch]$ModoIntegrado
+    )
+    if (-not $ModoIntegrado) {
+        Write-Encabezado -Titulo 'PERMISOS CONTPAQI PARA TERMINALES' -Subtitulo 'Acceso local seguro para usuarios estandar' -Color $Script:ColorTerminal
+    }
+    Write-Log -Mensaje 'Se aplicara Control total en rutas oficiales CONTPAQi, accesos directos y claves del fabricante, con respaldo SDDL previo.' -Nivel WARN
+    if (-not $ConfirmacionOmitida -and -not (Confirmar-Movimiento -Frase 'APLICAR PERMISOS' `
         -Accion 'Corregir permisos locales CONTPAQi' `
-        -Detalle 'Se agregaran permisos heredables al grupo Usuarios de Windows sin borrar las reglas existentes.')) { return }
+        -Detalle 'Se agregaran permisos oficiales a las identidades indicadas sin borrar reglas existentes y se respaldaran las ACL.')) {
+        return [PSCustomObject]@{ Correcto = $false; Cancelado = $true; Correctos = 0; Fallidos = 0; ArchivoRespaldo = $null }
+    }
 
     $rutas = @(Get-RutasPermisosTerminalCONTPAQi)
-    if ($rutas.Count -eq 0) {
-        Write-Log -Mensaje 'No se encontraron carpetas locales CONTPAQi a las que aplicar permisos.' -Nivel WARN
-        return
+    $clavesRegistro = @(Get-ClavesRegistroCONTPAQi)
+    if ($rutas.Count -eq 0 -and $clavesRegistro.Count -eq 0) {
+        Write-Log -Mensaje 'No se encontraron rutas ni claves locales CONTPAQi a las que aplicar permisos.' -Nivel WARN
+        return [PSCustomObject]@{ Correcto = $true; Cancelado = $false; Correctos = 0; Fallidos = 0; ArchivoRespaldo = $null }
     }
     $directorioRespaldo = Join-Path $env:ProgramData 'CONTPAQiToolbox\ACL'
     $archivoRespaldo = Join-Path $directorioRespaldo ("Permisos_{0}_{1}.json" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    $rutasJson = $rutas | ConvertTo-Json -Depth 4 -Compress
+    $rutasJson = ConvertTo-Json -InputObject @($rutas) -Depth 4 -Compress
+    $registroJson = ConvertTo-Json -InputObject @($clavesRegistro) -Depth 4 -Compress
     $codigoPermisos = @'
-param([string]$RoutesJson, [string]$BackupFile, [string]$ComputerName)
-$rutas = @($RoutesJson | ConvertFrom-Json)
-$sidUsuarios = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
-$cuentaUsuarios = $sidUsuarios.Translate([Security.Principal.NTAccount])
+param([string]$RoutesJson, [string]$RegistryJson, [string]$BackupFile, [string]$ComputerName)
+function ConvertTo-FlatList {
+    param([string]$Json)
+    $lista = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Json) -or $Json -eq 'null') { return @() }
+    $parsed = ConvertFrom-Json -InputObject $Json
+    if ($parsed -is [System.Array]) { foreach ($entry in $parsed) { if ($null -ne $entry) { $lista.Add($entry) } } }
+    elseif ($null -ne $parsed) { $lista.Add($parsed) }
+    return @($lista | ForEach-Object { $_ })
+}
+$rutas = @(ConvertTo-FlatList -Json $RoutesJson)
+$clavesRegistro = @(ConvertTo-FlatList -Json $RegistryJson)
+$sidValues = New-Object System.Collections.Generic.List[string]
+foreach ($sidValue in @('S-1-1-0','S-1-5-32-544','S-1-5-32-545','S-1-5-11','S-1-5-13','S-1-5-18','S-1-3-0')) { $sidValues.Add($sidValue) }
+try {
+    $administradorLocal = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
+        Where-Object { $_.SID -match '-500$' } | Select-Object -First 1 -ExpandProperty SID
+    if ($administradorLocal -and -not $sidValues.Contains([string]$administradorLocal)) { $sidValues.Add([string]$administradorLocal) }
+} catch { }
+$identidades = @($sidValues | ForEach-Object { New-Object Security.Principal.SecurityIdentifier($_) })
+function Open-RegistryKeyInternal {
+    param([string]$NativePath, [bool]$Writable)
+    if ($NativePath -match '^HKEY_LOCAL_MACHINE\\(.+)$') { return [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($matches[1], $Writable) }
+    if ($NativePath -match '^HKEY_CURRENT_USER\\(.+)$') { return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($matches[1], $Writable) }
+    return $null
+}
 $respaldos = @()
 foreach ($item in $rutas) {
-    $acl = Get-Acl -LiteralPath $item.Ruta -ErrorAction Stop
-    $respaldos += [PSCustomObject]@{ Ruta = [string]$item.Ruta; Sddl = $acl.Sddl; Derecho = [string]$item.Derecho }
+    try {
+        $acl = Get-Acl -LiteralPath $item.Ruta -ErrorAction Stop
+        $respaldos += [PSCustomObject]@{ Tipo = 'Archivo'; Ruta = [string]$item.Ruta; Sddl = $acl.Sddl; Derecho = 'FullControl'; Error = $null }
+    } catch {
+        $respaldos += [PSCustomObject]@{ Tipo = 'Archivo'; Ruta = [string]$item.Ruta; Sddl = $null; Derecho = 'FullControl'; Error = $_.Exception.Message }
+    }
+}
+foreach ($item in $clavesRegistro) {
+    try {
+        $nativePath = [string](@($item.Visible)[0])
+        $registryKey = Open-RegistryKeyInternal -NativePath $nativePath -Writable $false
+        if (-not $registryKey) { throw "No se pudo abrir $nativePath." }
+        try { $acl = $registryKey.GetAccessControl() } finally { $registryKey.Dispose() }
+        $respaldos += [PSCustomObject]@{ Tipo = 'Registro'; Ruta = $nativePath; Sddl = $acl.Sddl; Derecho = 'FullControl'; Error = $null }
+    } catch {
+        $respaldos += [PSCustomObject]@{ Tipo = 'Registro'; Ruta = [string](@($item.Visible)[0]); Sddl = $null; Derecho = 'FullControl'; Error = $_.Exception.Message }
+    }
 }
 $carpeta = Split-Path -Parent $BackupFile
 if (-not (Test-Path -LiteralPath $carpeta)) { New-Item -ItemType Directory -Path $carpeta -Force -ErrorAction Stop | Out-Null }
 [PSCustomObject]@{
     Equipo = $ComputerName
     Fecha = (Get-Date).ToString('o')
-    Grupo = $cuentaUsuarios.Value
+    Identidades = @($identidades | ForEach-Object { $_.Value })
     Rutas = $respaldos
 } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $BackupFile -Encoding UTF8 -ErrorAction Stop
 
 $resultados = @()
 foreach ($item in $rutas) {
     try {
-        $acl = Get-Acl -LiteralPath $item.Ruta -ErrorAction Stop
-        $derecho = [Security.AccessControl.FileSystemRights][Enum]::Parse([Security.AccessControl.FileSystemRights], [string]$item.Derecho)
-        $regla = New-Object Security.AccessControl.FileSystemAccessRule(
-            $cuentaUsuarios,
-            $derecho,
-            ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'),
-            [Security.AccessControl.PropagationFlags]::None,
-            [Security.AccessControl.AccessControlType]::Allow
-        )
-        $null = $acl.AddAccessRule($regla)
-        Set-Acl -LiteralPath $item.Ruta -AclObject $acl -ErrorAction Stop
-
-        $verificado = $false
-        foreach ($reglaActual in @((Get-Acl -LiteralPath $item.Ruta -ErrorAction Stop).Access)) {
-            try { $sidActual = $reglaActual.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
-            if ($sidActual -ne $sidUsuarios.Value -or $reglaActual.AccessControlType -ne 'Allow') { continue }
-            if (($reglaActual.FileSystemRights -band $derecho) -eq $derecho) { $verificado = $true; break }
+        $ruta = [string](@($item.Ruta)[0])
+        $tipoObjeto = [string](@($item.TipoObjeto)[0])
+        $acl = Get-Acl -LiteralPath $ruta -ErrorAction Stop
+        $cambios = 0
+        $denegacionesEliminadas = 0
+        foreach ($identidad in $identidades) {
+            $sidObjetivo = $identidad.Value
+            $tienePermiso = $false
+            foreach ($reglaActual in @($acl.Access)) {
+                try { $sidActual = $reglaActual.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+                if ($sidActual -ne $sidObjetivo) { continue }
+                $incluyeTotal = (($reglaActual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)
+                $interfiere = (($reglaActual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne 0)
+                if ($reglaActual.AccessControlType -eq 'Allow' -and $incluyeTotal) { $tienePermiso = $true }
+                if ($reglaActual.AccessControlType -eq 'Deny' -and $interfiere -and -not $reglaActual.IsInherited) {
+                    $acl.RemoveAccessRuleSpecific($reglaActual)
+                    $denegacionesEliminadas++
+                    $cambios++
+                }
+            }
+            if ($tienePermiso) { continue }
+            $herencia = if ($tipoObjeto -eq 'File') { [Security.AccessControl.InheritanceFlags]::None } else { [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit' }
+            $regla = New-Object Security.AccessControl.FileSystemAccessRule(
+                $identidad, [Security.AccessControl.FileSystemRights]::FullControl, $herencia,
+                [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow
+            )
+            $null = $acl.AddAccessRule($regla)
+            $cambios++
         }
-        $resultados += [PSCustomObject]@{ Ruta = [string]$item.Ruta; Derecho = [string]$item.Derecho; Correcto = $verificado; Error = $null }
+        if ($cambios -gt 0) { Set-Acl -LiteralPath $ruta -AclObject $acl -ErrorAction Stop }
+        $presentes = @{}
+        $bloqueos = New-Object System.Collections.Generic.List[string]
+        foreach ($reglaActual in @((Get-Acl -LiteralPath $ruta -ErrorAction Stop).Access)) {
+            try { $sidActual = $reglaActual.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+            if ($reglaActual.AccessControlType -eq 'Allow' -and (($reglaActual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl)) { $presentes[$sidActual] = $true }
+            if ($sidActual -in @($identidades.Value) -and $reglaActual.AccessControlType -eq 'Deny' -and (($reglaActual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne 0)) {
+                $bloqueos.Add("$sidActual$(if ($reglaActual.IsInherited) { ' (heredado)' } else { '' })")
+            }
+        }
+        $faltantes = @($identidades | Where-Object { -not $presentes.ContainsKey($_.Value) } | ForEach-Object { $_.Value })
+        $correcto = ($faltantes.Count -eq 0 -and $bloqueos.Count -eq 0)
+        $estado = if (-not $correcto) { 'Fallido' } elseif ($cambios -eq 0) { 'YaCorrecto' } else { 'Corregido' }
+        $resultados += [PSCustomObject]@{
+            Tipo = 'Archivo'; Ruta = $ruta; Derecho = 'FullControl'; Correcto = $correcto; Estado = $estado
+            Cambios = $cambios; DenegacionesEliminadas = $denegacionesEliminadas
+            Faltantes = $faltantes; Bloqueos = @($bloqueos); Error = $(if ($bloqueos.Count) { "Denegaciones vigentes: $($bloqueos -join ', ')" } else { $null })
+        }
     } catch {
-        $resultados += [PSCustomObject]@{ Ruta = [string]$item.Ruta; Derecho = [string]$item.Derecho; Correcto = $false; Error = $_.Exception.Message }
+        $resultados += [PSCustomObject]@{ Tipo = 'Archivo'; Ruta = [string](@($item.Ruta)[0]); Derecho = 'FullControl'; Correcto = $false; Estado = 'Fallido'; Cambios = 0; DenegacionesEliminadas = 0; Faltantes = @(); Bloqueos = @(); Error = $_.Exception.Message }
     }
 }
-[PSCustomObject]@{ Resultados = $resultados; ArchivoRespaldo = $BackupFile; Cuenta = $cuentaUsuarios.Value }
+foreach ($item in $clavesRegistro) {
+    try {
+        $ruta = [string](@($item.Visible)[0])
+        $registryKey = Open-RegistryKeyInternal -NativePath $ruta -Writable $true
+        if (-not $registryKey) { throw "No se pudo abrir $ruta con permisos de escritura." }
+        try {
+            $acl = $registryKey.GetAccessControl()
+            $cambios = 0
+            $denegacionesEliminadas = 0
+            foreach ($identidad in $identidades) {
+                $sidObjetivo = $identidad.Value
+                $tienePermiso = $false
+                foreach ($reglaActual in @($acl.Access)) {
+                    try { $sidActual = $reglaActual.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+                    if ($sidActual -ne $sidObjetivo) { continue }
+                    $incluyeTotal = (($reglaActual.RegistryRights -band [Security.AccessControl.RegistryRights]::FullControl) -eq [Security.AccessControl.RegistryRights]::FullControl)
+                    $interfiere = (($reglaActual.RegistryRights -band [Security.AccessControl.RegistryRights]::FullControl) -ne 0)
+                    if ($reglaActual.AccessControlType -eq 'Allow' -and $incluyeTotal) { $tienePermiso = $true }
+                    if ($reglaActual.AccessControlType -eq 'Deny' -and $interfiere -and -not $reglaActual.IsInherited) {
+                        $acl.RemoveAccessRuleSpecific($reglaActual)
+                        $denegacionesEliminadas++
+                        $cambios++
+                    }
+                }
+                if ($tienePermiso) { continue }
+                $regla = New-Object Security.AccessControl.RegistryAccessRule(
+                    $identidad, [Security.AccessControl.RegistryRights]::FullControl,
+                    [Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                    [Security.AccessControl.PropagationFlags]::None,
+                    [Security.AccessControl.AccessControlType]::Allow
+                )
+                $null = $acl.AddAccessRule($regla)
+                $cambios++
+            }
+            if ($cambios -gt 0) { $registryKey.SetAccessControl($acl) }
+            $aclVerificada = $registryKey.GetAccessControl()
+        } finally { $registryKey.Dispose() }
+        $presentes = @{}
+        $bloqueos = New-Object System.Collections.Generic.List[string]
+        foreach ($reglaActual in @($aclVerificada.Access)) {
+            try { $sidActual = $reglaActual.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
+            if ($reglaActual.AccessControlType -eq 'Allow' -and (($reglaActual.RegistryRights -band [Security.AccessControl.RegistryRights]::FullControl) -eq [Security.AccessControl.RegistryRights]::FullControl)) { $presentes[$sidActual] = $true }
+            if ($sidActual -in @($identidades.Value) -and $reglaActual.AccessControlType -eq 'Deny' -and (($reglaActual.RegistryRights -band [Security.AccessControl.RegistryRights]::FullControl) -ne 0)) {
+                $bloqueos.Add("$sidActual$(if ($reglaActual.IsInherited) { ' (heredado)' } else { '' })")
+            }
+        }
+        $faltantes = @($identidades | Where-Object { -not $presentes.ContainsKey($_.Value) } | ForEach-Object { $_.Value })
+        $correcto = ($faltantes.Count -eq 0 -and $bloqueos.Count -eq 0)
+        $estado = if (-not $correcto) { 'Fallido' } elseif ($cambios -eq 0) { 'YaCorrecto' } else { 'Corregido' }
+        $resultados += [PSCustomObject]@{
+            Tipo = 'Registro'; Ruta = $ruta; Derecho = 'FullControl'; Correcto = $correcto; Estado = $estado
+            Cambios = $cambios; DenegacionesEliminadas = $denegacionesEliminadas
+            Faltantes = $faltantes; Bloqueos = @($bloqueos); Error = $(if ($bloqueos.Count) { "Denegaciones vigentes: $($bloqueos -join ', ')" } else { $null })
+        }
+    } catch {
+        $resultados += [PSCustomObject]@{ Tipo = 'Registro'; Ruta = [string](@($item.Ruta)[0]); Derecho = 'FullControl'; Correcto = $false; Estado = 'Fallido'; Cambios = 0; DenegacionesEliminadas = 0; Faltantes = @(); Bloqueos = @(); Error = $_.Exception.Message }
+    }
+}
+[PSCustomObject]@{ Resultados = $resultados; ArchivoRespaldo = $BackupFile; Identidades = @($identidades | ForEach-Object { $_.Value }) }
 '@
-    Write-Log -Mensaje "Respaldando ACL y aplicando permisos en $($rutas.Count) ruta(s)..." -Nivel PROGRESS
+    Write-Log -Mensaje "Respaldando ACL y aplicando permisos en $($rutas.Count) ruta(s) y $($clavesRegistro.Count) clave(s) de registro..." -Nivel PROGRESS
     $worker = Invoke-ResponsiveWorker -ScriptText $codigoPermisos `
-        -Arguments @($rutasJson, $archivoRespaldo, $env:COMPUTERNAME) `
+        -Arguments @($rutasJson, $registroJson, $archivoRespaldo, $env:COMPUTERNAME) `
         -TimeoutSeconds 1800 -Activity 'Corrigiendo permisos CONTPAQi'
     if (-not $worker.Correcto -or $worker.Timeout -or -not $worker.Resultado) {
         Write-Log -Mensaje "No se aplicaron los permisos de forma completa: $($worker.Error)" -Nivel ERROR
-        return
+        return [PSCustomObject]@{ Correcto = $false; Cancelado = $false; Correctos = 0; Fallidos = ($rutas.Count + $clavesRegistro.Count); ArchivoRespaldo = $archivoRespaldo }
     }
 
     $correctos = 0
+    $yaCorrectos = 0
+    $corregidos = 0
     $fallidos = 0
     foreach ($resultado in @($worker.Resultado.Resultados)) {
         if ($resultado.Correcto) {
             $correctos++
-            Write-Log -Mensaje "$($resultado.Derecho) verificado: $($resultado.Ruta)" -Nivel OK
+            if ($resultado.Estado -eq 'YaCorrecto') {
+                $yaCorrectos++
+                Write-Log -Mensaje "Permisos ya correctos, sin cambios: $($resultado.Ruta)" -Nivel OK
+            } else {
+                $corregidos++
+                $detalleCambio = if ([int]$resultado.DenegacionesEliminadas -gt 0) { " | $($resultado.DenegacionesEliminadas) denegacion(es) explicita(s) retirada(s)" } else { '' }
+                Write-Log -Mensaje "Permisos corregidos y verificados: $($resultado.Ruta)$detalleCambio" -Nivel OK
+            }
         } else {
             $fallidos++
-            Write-Log -Mensaje "No se pudo corregir $($resultado.Ruta): $($resultado.Error)" -Nivel ERROR
+            $faltantesTexto = if (@($resultado.Faltantes).Count) { " | SID faltantes: $(@($resultado.Faltantes) -join ', ')" } else { '' }
+            Write-Log -Mensaje "No se pudo validar $($resultado.Ruta): $($resultado.Error)$faltantesTexto" -Nivel ERROR
         }
     }
     Write-Log -Mensaje "Respaldo recuperable de permisos: $($worker.Resultado.ArchivoRespaldo)" -Nivel INFO
@@ -4615,8 +5106,128 @@ foreach ($item in $rutas) {
         Write-Log -Mensaje "Recursos de red detectados (no modificados): $($recursosRemotos -join ', '). Sus permisos NTFS y de recurso compartido deben corregirse en el servidor." -Nivel WARN
     }
     Write-Separador -Color $(if ($fallidos -eq 0) { $Script:ColorExito } else { $Script:ColorAdvertencia })
-    Write-Log -Mensaje "Permisos locales finalizados: $correctos correctos | $fallidos con incidencia." -Nivel $(if ($fallidos -eq 0) { 'OK' } else { 'WARN' })
+    Write-Log -Mensaje "Permisos locales finalizados: $yaCorrectos ya correctos | $corregidos corregidos | $fallidos con incidencia." -Nivel $(if ($fallidos -eq 0) { 'OK' } else { 'WARN' })
     if ($fallidos -eq 0) { Write-Log -Mensaje 'Cierra y vuelve a abrir CONTPAQi para que la terminal use los permisos actualizados.' -Nivel INFO }
+    return [PSCustomObject]@{
+        Correcto = ($fallidos -eq 0); Cancelado = $false; Correctos = $correctos; YaCorrectos = $yaCorrectos; Corregidos = $corregidos; Fallidos = $fallidos
+        ArchivoRespaldo = [string]$worker.Resultado.ArchivoRespaldo
+    }
+}
+
+function Invoke-ConfigurarCentroConfianzaExcelCONTPAQi {
+    param([switch]$ConfirmacionOmitida, [switch]$ModoIntegrado)
+    $versiones = @('16.0','15.0','14.0') | Where-Object {
+        (Test-Path -LiteralPath "HKCU:\Software\Microsoft\Office\$_\Excel") -or
+        (Test-Path -LiteralPath "HKLM:\SOFTWARE\Microsoft\Office\$_\Excel") -or
+        (Test-Path -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\$_\Excel")
+    }
+    if ($versiones.Count -eq 0) {
+        Write-Log -Mensaje 'Excel no esta instalado; se omite la configuracion del Centro de confianza.' -Nivel INFO
+        return [PSCustomObject]@{ Correcto = $true; Omitido = $true; Correctos = 0; Fallidos = 0; Respaldos = @() }
+    }
+    $ubicaciones = @('C:\Compacw', (Join-Path ${env:ProgramFiles(x86)} 'Compacw')) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+    if (-not $ModoIntegrado) {
+        Write-Encabezado -Titulo 'CENTRO DE CONFIANZA EXCEL' -Subtitulo 'Compatibilidad con herramientas CONTPAQi' -Color 'Yellow'
+    }
+    Write-Log -Mensaje 'SEGURIDAD: las ubicaciones de confianza y macros/ActiveX habilitados reducen la proteccion de Office. Solo se aplicaran al usuario actual y con respaldo.' -Nivel WARN
+    if (-not $ConfirmacionOmitida -and -not (Confirmar-Movimiento -Frase 'CONFIGURAR EXCEL' `
+        -Accion 'Configurar Centro de confianza de Excel para CONTPAQi' `
+        -Detalle 'Se habilitaran macros, ActiveX y acceso VBA para el usuario actual; las claves anteriores se respaldaran.')) {
+        return [PSCustomObject]@{ Correcto = $false; Omitido = $true; Correctos = 0; Fallidos = 0; Respaldos = @() }
+    }
+    $versionesJson = ConvertTo-Json -InputObject @($versiones) -Compress
+    $ubicacionesJson = ConvertTo-Json -InputObject @($ubicaciones) -Compress
+    $directorioRespaldo = Join-Path $env:ProgramData ("CONTPAQiToolbox\ExcelTrust\{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $codigo = @'
+param([string]$VersionsJson, [string]$LocationsJson, [string]$BackupDirectory)
+function Expand-JsonArray([string]$Json) {
+    $list = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Json) -or $Json -eq 'null') { return @() }
+    $value = ConvertFrom-Json -InputObject $Json
+    if ($value -is [Array]) { foreach ($entry in $value) { $list.Add($entry) } } else { $list.Add($value) }
+    return @($list | ForEach-Object { $_ })
+}
+$versions = @(Expand-JsonArray $VersionsJson | ForEach-Object { [string]$_ })
+$locations = @(Expand-JsonArray $LocationsJson | ForEach-Object { [string]$_ })
+if (-not (Test-Path -LiteralPath $BackupDirectory)) { New-Item -ItemType Directory -Path $BackupDirectory -Force -ErrorAction Stop | Out-Null }
+$results = @()
+foreach ($version in $versions) {
+    try {
+        $security = "HKCU:\Software\Microsoft\Office\$version\Excel\Security"
+        $commonSecurity = "HKCU:\Software\Microsoft\Office\$version\Common\Security"
+        $trustedRoot = Join-Path $security 'Trusted Locations'
+        $securityNative = "HKCU\Software\Microsoft\Office\$version\Excel\Security"
+        $commonNative = "HKCU\Software\Microsoft\Office\$version\Common\Security"
+        $backups = @()
+        if (Test-Path -LiteralPath $security) {
+            $file = Join-Path $BackupDirectory "Excel_${version}_Security.reg"
+            & reg.exe export $securityNative $file /y 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $backups += $file }
+        }
+        if (Test-Path -LiteralPath $commonSecurity) {
+            $file = Join-Path $BackupDirectory "Office_${version}_CommonSecurity.reg"
+            & reg.exe export $commonNative $file /y 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $backups += $file }
+        }
+        foreach ($key in @($security, $commonSecurity, $trustedRoot)) {
+            if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+        }
+        New-ItemProperty -Path $security -Name 'VBAWarnings' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $security -Name 'AccessVBOM' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path $commonSecurity -Name 'UFIControls' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+
+        $index = 90
+        foreach ($location in $locations) {
+            $normalized = [IO.Path]::GetFullPath($location).TrimEnd('\') + '\'
+            $existing = @(Get-ChildItem -LiteralPath $trustedRoot -ErrorAction SilentlyContinue | Where-Object {
+                try { ([IO.Path]::GetFullPath([string](Get-ItemPropertyValue -LiteralPath $_.PSPath -Name Path -ErrorAction Stop)).TrimEnd('\') + '\') -ieq $normalized } catch { $false }
+            } | Select-Object -First 1)
+            $locationKey = if ($existing.Count) { $existing[0].PSPath } else {
+                while (Test-Path -LiteralPath (Join-Path $trustedRoot "Location$index")) { $index++ }
+                $newKey = Join-Path $trustedRoot "Location$index"
+                New-Item -Path $newKey -Force -ErrorAction Stop | Out-Null
+                $index++
+                $newKey
+            }
+            New-ItemProperty -Path $locationKey -Name Path -Value $normalized -PropertyType String -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $locationKey -Name AllowSubfolders -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $locationKey -Name Description -Value 'CONTPAQi Toolbox - ubicacion oficial' -PropertyType String -Force -ErrorAction Stop | Out-Null
+        }
+
+        $fileBlock = Join-Path $security 'FileBlock'
+        if (Test-Path -LiteralPath $fileBlock) { Remove-Item -LiteralPath $fileBlock -Recurse -Force -ErrorAction Stop }
+        $policy = Test-Path -LiteralPath "HKCU:\Software\Policies\Microsoft\Office\$version\Excel\Security"
+        $verifySecurity = Get-ItemProperty -LiteralPath $security -ErrorAction Stop
+        $verifyCommon = Get-ItemProperty -LiteralPath $commonSecurity -ErrorAction Stop
+        $ok = ([int]$verifySecurity.VBAWarnings -eq 1 -and [int]$verifySecurity.AccessVBOM -eq 1 -and [int]$verifyCommon.UFIControls -eq 1)
+        $results += [PSCustomObject]@{ Version = $version; Correcto = $ok; PoliticaDetectada = $policy; Respaldos = $backups; Error = $null }
+    } catch {
+        $results += [PSCustomObject]@{ Version = $version; Correcto = $false; PoliticaDetectada = $false; Respaldos = @(); Error = $_.Exception.Message }
+    }
+}
+[PSCustomObject]@{ Resultados = $results; DirectorioRespaldo = $BackupDirectory }
+'@
+    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -Arguments @($versionesJson, $ubicacionesJson, $directorioRespaldo) `
+        -TimeoutSeconds 180 -Activity 'Configurando Centro de confianza de Excel'
+    if (-not $worker.Correcto -or $worker.Timeout -or -not $worker.Resultado) {
+        Write-Log -Mensaje "No se pudo configurar Excel: $($worker.Error)" -Nivel ERROR
+        return [PSCustomObject]@{ Correcto = $false; Omitido = $false; Correctos = 0; Fallidos = $versiones.Count; Respaldos = @() }
+    }
+    $correctos = 0; $fallidos = 0; $respaldos = New-Object System.Collections.Generic.List[string]
+    foreach ($resultado in @($worker.Resultado.Resultados)) {
+        foreach ($respaldo in @($resultado.Respaldos)) { if ($respaldo) { $respaldos.Add([string]$respaldo) } }
+        if ($resultado.Correcto) {
+            $correctos++
+            Write-Log -Mensaje "Excel $($resultado.Version): Centro de confianza configurado y verificado para el usuario actual." -Nivel OK
+            if ($resultado.PoliticaDetectada) { Write-Log -Mensaje "Excel $($resultado.Version): una directiva de grupo puede reemplazar estos valores." -Nivel WARN }
+        } else {
+            $fallidos++
+            Write-Log -Mensaje "Excel $($resultado.Version): no se pudo completar la configuracion: $($resultado.Error)" -Nivel ERROR
+        }
+    }
+    Write-Log -Mensaje "Respaldos de Excel: $($worker.Resultado.DirectorioRespaldo)" -Nivel INFO
+    return [PSCustomObject]@{ Correcto = ($fallidos -eq 0); Omitido = $false; Correctos = $correctos; Fallidos = $fallidos; Respaldos = @($respaldos) }
 }
 
 function Get-EventosCONTPAQiRecientes {
@@ -4633,191 +5244,209 @@ function Get-EventosCONTPAQiRecientes {
     }
 }
 
-function Show-DiagnosticoTicket {
-    Write-Encabezado -Titulo 'DIAGNOSTICO PARA TICKET' -Subtitulo 'Revision segura: servicios, espacio, rutas y eventos' -Color 'Cyan'
-    $alertas = 0
-
-    Write-SeccionMenu -Titulo 'SERVICIOS CRITICOS' -Color 'Green'
-    $servicios = @($ServiciosSQL + $ServiciosSACI + $ServiciosLicencias | Select-Object -Unique)
-    if ($servicios.Count -eq 0) {
-        Write-Log -Mensaje 'No se detectaron servicios SQL o CONTPAQi en este equipo.' -Nivel INFO
-    }
-    foreach ($nombre in $servicios) {
-        $servicio = Get-Service -Name $nombre -ErrorAction SilentlyContinue
-        if (-not $servicio) { continue }
-        if ($servicio.Status -eq 'Running') {
-            Write-Log -Mensaje "$($nombre): activo." -Nivel OK
-        } else {
-            $alertas++
-            Write-Log -Mensaje "$($nombre): $($servicio.Status). Recomendacion: validar dependencias y reiniciarlo de forma controlada." -Nivel ERROR
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'ESPACIO EN DISCO' -Color 'Yellow'
-    foreach ($unidad in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null })) {
-        $libreGB = [math]::Round($unidad.Free / 1GB, 2)
-        $totalGB = [math]::Round(($unidad.Used + $unidad.Free) / 1GB, 2)
-        if ($libreGB -lt 10) {
-            $alertas++
-            Write-Log -Mensaje "Unidad $($unidad.Name): $libreGB GB libres de $totalGB GB. Riesgo para SQL, temporales y respaldos." -Nivel WARN
-        } else {
-            Write-Log -Mensaje "Unidad $($unidad.Name): $libreGB GB libres de $totalGB GB." -Nivel OK
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'RUTAS LOCALES CONTPAQi' -Color 'Magenta'
-    $rutas = @(Get-RutasCONTPAQi)
-    if ($rutas.Count -eq 0) {
-        Write-Log -Mensaje 'No se encontraron rutas locales comunes de CONTPAQi/Compac.' -Nivel INFO
-    } else {
-        foreach ($ruta in $rutas) {
-            try {
-                $acl = Get-Acl -LiteralPath $ruta -ErrorAction Stop
-                $reglas = @($acl.Access | Where-Object { $_.AccessControlType -eq 'Allow' })
-                Write-Log -Mensaje "$ruta | ACL accesible | reglas permitidas: $($reglas.Count)" -Nivel OK
-            } catch {
-                $alertas++
-                Write-Log -Mensaje "$ruta | no se pudo leer permisos: $($_.Exception.Message)" -Nivel WARN
-            }
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'EVENTOS RECIENTES DE WINDOWS' -Color 'Red'
-    $eventos = @(Get-EventosCONTPAQiRecientes)
-    if ($eventos.Count -eq 0) {
-        Write-Log -Mensaje 'No se detectaron eventos recientes relacionados con CONTPAQi, SACI o SQL.' -Nivel OK
-    } else {
-        $alertas += $eventos.Count
-        foreach ($evento in $eventos) {
-            $mensaje = (($evento.Message -replace '[\r\n]+', ' ') -replace '\s+', ' ').Trim()
-            if ($mensaje.Length -gt 220) { $mensaje = $mensaje.Substring(0, 220) + '...' }
-            Write-Log -Mensaje "$($evento.TimeCreated.ToString('dd/MM HH:mm')) | $($evento.ProviderName) | $mensaje" -Nivel WARN
-        }
-    }
-
-    Write-SeccionMenu -Titulo 'SQL Y REINICIO PENDIENTE' -Color 'Green'
-    $motores = @(Get-ServiciosMotorSQL)
-    if ($motores.Count -eq 0) {
-        Write-Log -Mensaje 'No se detectaron instancias del motor SQL Server.' -Nivel INFO
-    } else {
-        foreach ($motor in $motores) {
-            $instancia = Get-NombreInstanciaSQL -NombreServicio $motor.Name
-            if ($motor.Status -ne 'Running') {
-                $alertas++
-                Write-Log -Mensaje "${instancia}: motor SQL detenido ($($motor.Name))." -Nivel ERROR
-                continue
-            }
-            $pruebaSql = Test-ConexionSQLLocal -Instancia $instancia -TimeoutSegundos 4
-            if ($pruebaSql.Correcto) {
-                Write-Log -Mensaje "$instancia responde correctamente | SQL $($pruebaSql.Version)" -Nivel OK
-            } else {
-                $alertas++
-                Write-Log -Mensaje "$instancia esta activo, pero no acepta conexion integrada local: $($pruebaSql.Error)" -Nivel ERROR
-            }
-        }
-    }
-    if (Test-ReinicioPendiente) {
-        $alertas++
-        Write-Log -Mensaje 'Windows tiene un reinicio pendiente.' -Nivel WARN
-    } else {
-        Write-Log -Mensaje 'Windows no reporta reinicio pendiente.' -Nivel OK
-    }
-
-    Write-SeccionMenu -Titulo 'SIGUIENTE PASO SUGERIDO' -Color 'Cyan'
-    if ($alertas -eq 0) {
-        Write-Log -Mensaje 'Sin alertas locales. Si el problema ocurre en terminal, revisa IP/nombre del SACI, conectividad de red y la version instalada.' -Nivel OK
-    } else {
-        Write-Log -Mensaje "Se detectaron $alertas alerta(s). Adjunta esta bitacora al ticket antes de reiniciar o reparar componentes." -Nivel WARN
-    }
-}
-
-function Export-PaqueteSoporte {
-    param(
-        [string]$DestinationDirectory = [Environment]::GetFolderPath('Desktop'),
-        [switch]$NoAbrir
-    )
-    Write-Encabezado -Titulo 'PAQUETE DE SOPORTE' -Subtitulo 'Evidencia lista para adjuntar al ticket' -Color 'Cyan'
-
-    $marcaTiempo = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $desktop = $DestinationDirectory
-    if (-not (Test-Path -LiteralPath $desktop -PathType Container)) {
-        New-Item -ItemType Directory -Path $desktop -Force -ErrorAction Stop | Out-Null
-    }
-    $basePaquetes = Join-Path $env:ProgramData 'CONTPAQiToolbox\SupportPackages'
-    $staging = Join-Path $basePaquetes ("Staging_{0}" -f ([guid]::NewGuid().ToString('N')))
-    $zipPath = Join-Path $desktop ("CONTPAQi_Soporte_{0}_{1}.zip" -f $env:COMPUTERNAME, $marcaTiempo)
-
-    try {
-        New-Item -ItemType Directory -Path $staging -Force -ErrorAction Stop | Out-Null
-        Write-Log -Mensaje '[1/5] Recopilando resumen del equipo...' -Nivel PROGRESS
-
-        $so = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        $resumen = @(
-            "CONTPAQi Toolbox v$($Script:Version) - Paquete de soporte",
-            "Generado: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-            "Equipo: $env:COMPUTERNAME",
-            "Usuario operador: $env:USERDOMAIN\$env:USERNAME",
-            "Perfil detectado: $(Get-PerfilEquipo)",
-            "Windows: $($so.Caption) $($so.Version) Build $($so.BuildNumber)",
-            "Arquitectura: $env:PROCESSOR_ARCHITECTURE",
-            "Ultimo arranque: $($so.LastBootUpTime)",
-            "Reinicio pendiente: $(if (Test-ReinicioPendiente) { 'SI' } else { 'NO' })"
-        )
-        $resumen | Set-Content -LiteralPath (Join-Path $staging '00_Resumen.txt') -Encoding UTF8 -ErrorAction Stop
-
-        Write-Log -Mensaje '[2/5] Exportando servicios, procesos e instalaciones...' -Nivel PROGRESS
-        $serviciosSoporte = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -match 'CONTPAQ|COMPAC|SACI|AppKey|AuthServer|XML|^MSSQL|^SQLBrowser$' -or
-            $_.DisplayName -match 'CONTPAQ|COMPAC|SACI|SQL Server|XML en l.nea'
-        } | Sort-Object Name | Select-Object Status, StartType, Name, DisplayName)
-        $serviciosSoporte | Export-Csv -LiteralPath (Join-Path $staging '01_Servicios.csv') -NoTypeInformation -Encoding UTF8
-
-        @((Get-ProcesosCONTPAQi) + (Get-ProcesosPID)) |
-            Sort-Object PID -Unique |
-            Select-Object PID, Nombre, Modulo, Usuario |
-            Export-Csv -LiteralPath (Join-Path $staging '02_Procesos.csv') -NoTypeInformation -Encoding UTF8
-
-        Get-ProgramasInstalados |
-            Where-Object { $_.DisplayName -match 'CONTPAQ|COMPAC|SQL Server' } |
-            Sort-Object DisplayName |
-            Export-Csv -LiteralPath (Join-Path $staging '03_Programas.csv') -NoTypeInformation -Encoding UTF8
-
-        Write-Log -Mensaje '[3/5] Exportando eventos y almacenamiento...' -Nivel PROGRESS
-        Get-EventosCONTPAQiRecientes |
-            Select-Object TimeCreated, LevelDisplayName, ProviderName, Id, Message |
-            Export-Csv -LiteralPath (Join-Path $staging '04_Eventos.csv') -NoTypeInformation -Encoding UTF8
-        Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
-            Select-Object DeviceID, VolumeName,
-                @{Name='TamanoGB';Expression={[math]::Round($_.Size / 1GB, 2)}},
-                @{Name='LibreGB';Expression={[math]::Round($_.FreeSpace / 1GB, 2)}} |
-            Export-Csv -LiteralPath (Join-Path $staging '05_Discos.csv') -NoTypeInformation -Encoding UTF8
-
-        Write-Log -Mensaje '[4/5] Exportando configuracion de red y bitacora...' -Nivel PROGRESS
-        (& ipconfig.exe /all 2>&1) | Set-Content -LiteralPath (Join-Path $staging '06_Red.txt') -Encoding UTF8
-        if ($Script:LogFile -and (Test-Path -LiteralPath $Script:LogFile)) {
-            Copy-Item -LiteralPath $Script:LogFile -Destination (Join-Path $staging '07_Bitacora_Toolbox.log') -Force
-        }
-
-        Write-Log -Mensaje '[5/5] Comprimiendo evidencia...' -Nivel PROGRESS
-        Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zipPath -CompressionLevel Optimal -Force -ErrorAction Stop
-        Write-Log -Mensaje "Paquete creado correctamente: $zipPath" -Nivel OK
-        if (-not $NoAbrir) {
-            try { Start-Process -FilePath 'explorer.exe' -ArgumentList "/select,`"$zipPath`"" -ErrorAction Stop | Out-Null } catch { }
-        }
-    } catch {
-        Write-Log -Mensaje "No se pudo crear el paquete de soporte: $($_.Exception.Message)" -Nivel ERROR
-    } finally {
-        $baseCompleta = [System.IO.Path]::GetFullPath($basePaquetes).TrimEnd('\')
-        $stagingCompleto = [System.IO.Path]::GetFullPath($staging).TrimEnd('\')
-        if ($stagingCompleto.StartsWith($baseCompleta + '\', [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $stagingCompleto)) {
-            Remove-Item -LiteralPath $stagingCompleto -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
 
 # --- DIAGNOSTICO INTELIGENTE Y REPORTE PROFESIONAL ---
 # Todas las pruebas de esta seccion son de solo lectura. El diagnostico explica
 # evidencia, consecuencia y siguiente accion, pero nunca aplica reparaciones.
+function Get-NombreOfficeLegible {
+    param([AllowEmptyString()][string]$ProductReleaseId)
+    if ([string]::IsNullOrWhiteSpace($ProductReleaseId)) { return 'Microsoft Office / Excel' }
+    $principal = @($ProductReleaseId -split ',' | Where-Object { $_ } | Select-Object -First 1)[0]
+    switch -Regex ($principal) {
+        '^O365ProPlusRetail$'       { return 'Microsoft 365 Apps para empresas' }
+        '^O365BusinessRetail$'      { return 'Microsoft 365 Apps para negocios' }
+        '^Professional2024Retail$'  { return 'Microsoft Office Professional 2024' }
+        '^ProPlus2024Volume$'       { return 'Microsoft Office Professional Plus 2024' }
+        '^Professional2021Retail$'  { return 'Microsoft Office Professional 2021' }
+        '^ProPlus2021Volume$'       { return 'Microsoft Office Professional Plus 2021' }
+        '^Professional2019Retail$'  { return 'Microsoft Office Professional 2019' }
+        '^ProPlus2019Volume$'       { return 'Microsoft Office Professional Plus 2019' }
+        '^HomeBusiness(2019|2021|2024)Retail$' { return "Microsoft Office Hogar y Empresas $($matches[1])" }
+        '^Excel(2019|2021|2024)Retail$' { return "Microsoft Excel $($matches[1])" }
+        default { return "Microsoft Office ($principal)" }
+    }
+}
+
+function Get-MicrosoftExcelInfo {
+    $configuracion = $null
+    foreach ($ruta in @(
+        'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration'
+    )) {
+        if (Test-Path -LiteralPath $ruta) {
+            try { $configuracion = Get-ItemProperty -LiteralPath $ruta -ErrorAction Stop; break } catch { }
+        }
+    }
+
+    $excelPath = $null
+    foreach ($ruta in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\excel.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\excel.exe'
+    )) {
+        if (-not (Test-Path -LiteralPath $ruta)) { continue }
+        try {
+            $candidate = [string](Get-ItemProperty -LiteralPath $ruta -ErrorAction Stop).'(default)'
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { $excelPath = $candidate; break }
+        } catch { }
+    }
+    if (-not $excelPath -and $configuracion.InstallationPath) {
+        $candidate = Join-Path ([string]$configuracion.InstallationPath) 'Root\Office16\EXCEL.EXE'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $excelPath = $candidate }
+    }
+
+    $productoRegistrado = if ($configuracion) { [string]$configuracion.ProductReleaseIds } else { '' }
+    $producto = Get-NombreOfficeLegible -ProductReleaseId $productoRegistrado
+    $version = if ($configuracion.VersionToReport) { [string]$configuracion.VersionToReport } elseif ($excelPath) { [Diagnostics.FileVersionInfo]::GetVersionInfo($excelPath).FileVersion } else { 'N/D' }
+    $plataforma = if ($configuracion.Platform) { [string]$configuracion.Platform } elseif ($excelPath -match '(?i)Program Files \(x86\)') { 'x86' } elseif ($excelPath) { 'x64' } else { '' }
+    $arquitectura = if ($plataforma -eq 'x86') { '32 bits' } elseif ($plataforma -eq 'x64') { '64 bits' } else { 'No determinada' }
+
+    $consultaLicencia = @'
+Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='0ff1ce15-a989-479d-af46-f275c6370663'" -ErrorAction Stop |
+    Where-Object {
+        ($_.PartialProductKey -or $_.LicenseStatus -ne 0) -and
+        "$($_.Name) $($_.Description)" -match '(?i)Office|Excel|O365|Microsoft 365'
+    } |
+    Sort-Object @{Expression={ if ([int]$_.LicenseStatus -eq 1) { 0 } else { 1 } }}, Name |
+    Select-Object -First 1 Name, Description, LicenseStatus, LicenseStatusReason, GracePeriodRemaining
+'@
+    $resultadoLicencia = Invoke-ResponsiveWorker -ScriptText $consultaLicencia -TimeoutSeconds 30 -Activity 'Validando licencia de Microsoft Office'
+    $licencia = if ($resultadoLicencia.Correcto) { $resultadoLicencia.Resultado } else { $null }
+    $estadoLicencia = if (-not $excelPath) { 'NO APLICA' } elseif (-not $licencia) { 'NO SE PUDO CONFIRMAR' } else {
+        switch ([int]$licencia.LicenseStatus) {
+            1 { 'ACTIVADA' }
+            2 { 'PERIODO DE GRACIA' }
+            3 { 'GRACIA VENCIDA' }
+            4 { 'NO ORIGINAL / GRACIA' }
+            5 { 'MODO NOTIFICACION' }
+            6 { 'GRACIA EXTENDIDA' }
+            default { 'NO ACTIVADA' }
+        }
+    }
+    $tipoLicencia = if (-not $licencia) { 'No determinado' } elseif ($licencia.Description -match '(?i)KMSCLIENT') { 'Volumen KMS' } elseif ($licencia.Description -match '(?i)MAK') { 'Volumen MAK' } elseif ($licencia.Description -match '(?i)RETAIL') { 'Retail' } elseif ($productoRegistrado -match '(?i)O365') { 'Suscripcion Microsoft 365' } else { 'Licencia de Office' }
+    $compatibilidad = if (-not $excelPath) { 'Excel no detectado' } elseif ($arquitectura -eq '32 bits') { 'RECOMENDADO PARA CONTPAQi' } elseif ($arquitectura -eq '64 bits') { 'VALIDAR COMPLEMENTOS CONTPAQi' } else { 'ARQUITECTURA POR CONFIRMAR' }
+    return [PSCustomObject]@{
+        Detectado = [bool]$excelPath
+        Producto = $producto
+        Version = $version
+        Arquitectura = $arquitectura
+        Ejecutable = $excelPath
+        Licencia = $estadoLicencia
+        TipoLicencia = $tipoLicencia
+        Compatibilidad = $compatibilidad
+        ProductReleaseId = $productoRegistrado
+    }
+}
+
+function Get-PrincipalesBasesDiagnosticoCONTPAQi {
+    param([AllowEmptyCollection()][string[]]$Instancias = @())
+
+    $resultados = New-Object System.Collections.Generic.List[object]
+    $consulta = @"
+SET NOCOUNT ON;
+CREATE TABLE #Espacio (
+    Nombre sysname NOT NULL,
+    DatosAsignadosMB decimal(19,2) NULL,
+    DatosUsadosMB decimal(19,2) NULL
+);
+DECLARE @db sysname, @sql nvarchar(max);
+DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE database_id > 4 AND state = 0 AND HAS_DBACCESS(name) = 1;
+OPEN dbs;
+FETCH NEXT FROM dbs INTO @db;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @sql = N'USE ' + QUOTENAME(@db) + N';
+            INSERT INTO #Espacio (Nombre, DatosAsignadosMB, DatosUsadosMB)
+            SELECT DB_NAME(),
+                   CAST(SUM(CASE WHEN type = 0 THEN size ELSE 0 END) * 8.0 / 1024 AS decimal(19,2)),
+                   CAST(SUM(CASE WHEN type = 0 THEN ISNULL(FILEPROPERTY(name, ''SpaceUsed''), 0) ELSE 0 END) * 8.0 / 1024 AS decimal(19,2))
+            FROM sys.database_files;';
+        EXEC sys.sp_executesql @sql;
+    END TRY
+    BEGIN CATCH
+    END CATCH;
+    FETCH NEXT FROM dbs INTO @db;
+END;
+CLOSE dbs;
+DEALLOCATE dbs;
+
+CREATE TABLE #LogSpace (Nombre sysname, LogSizeMB float, LogUsedPct float, Estado int);
+BEGIN TRY
+    INSERT INTO #LogSpace EXEC ('DBCC SQLPERF(LOGSPACE) WITH NO_INFOMSGS;');
+END TRY
+BEGIN CATCH
+END CATCH;
+
+CREATE TABLE #Respaldos (Nombre sysname PRIMARY KEY, UltimoRespaldo datetime NULL);
+BEGIN TRY
+    INSERT INTO #Respaldos (Nombre, UltimoRespaldo)
+    SELECT database_name, MAX(backup_finish_date)
+    FROM msdb.dbo.backupset
+    WHERE type = 'D'
+    GROUP BY database_name;
+END TRY
+BEGIN CATCH
+END CATCH;
+
+SELECT TOP (5)
+    d.name AS Nombre,
+    d.state_desc AS Estado,
+    CAST(ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) AS decimal(19,2)) AS DatosAsignadosMB,
+    CAST(ISNULL(e.DatosUsadosMB, 0) AS decimal(19,2)) AS DatosUsadosMB,
+    CAST(CASE WHEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) > ISNULL(e.DatosUsadosMB, 0)
+              THEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) - ISNULL(e.DatosUsadosMB, 0) ELSE 0 END AS decimal(19,2)) AS DatosLibresMB,
+    CAST(CASE WHEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) > 0
+              THEN ISNULL(e.DatosUsadosMB, 0) * 100.0 / ISNULL(e.DatosAsignadosMB, m.AsignadoMB) ELSE 0 END AS decimal(9,2)) AS UsoDatosPct,
+    CAST(ISNULL(l.LogSizeMB, 0) AS decimal(19,2)) AS LogMB,
+    CAST(ISNULL(l.LogUsedPct, 0) AS decimal(9,2)) AS LogUsadoPct,
+    r.UltimoRespaldo
+FROM sys.databases d
+LEFT JOIN #Espacio e ON e.Nombre = d.name
+LEFT JOIN #LogSpace l ON l.Nombre = d.name
+LEFT JOIN #Respaldos r ON r.Nombre = d.name
+OUTER APPLY (
+    SELECT SUM(CASE WHEN type = 0 THEN size ELSE 0 END) * 8.0 / 1024 AS AsignadoMB
+    FROM sys.master_files
+    WHERE database_id = d.database_id
+) m
+WHERE d.database_id > 4
+  AND NOT (d.name LIKE 'document[_]%' AND (d.name LIKE '%[_]content' OR d.name LIKE '%[_]metadata'))
+  AND d.name NOT IN ('ADD_Catalogos','CompacWAdmin','GeneralSQL','dbDocumentosDigitales','CONTPAQ_I_SDK')
+ORDER BY ISNULL(e.DatosUsadosMB, 0) DESC,
+         ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) DESC,
+         d.name;
+"@
+
+    foreach ($instancia in @($Instancias | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        $resultado = Invoke-SqlTableResponsive -Instancia $instancia -Consulta $consulta -TimeoutSegundos 55 -Actividad "Leyendo empresas principales de $instancia"
+        if (-not $resultado.Correcto) {
+            Write-Log -Mensaje "No fue posible obtener empresas de $($instancia): $($resultado.Error)" -Nivel WARN
+            continue
+        }
+        foreach ($fila in @($resultado.Filas)) {
+            $respaldo = $null
+            if ($null -ne $fila.UltimoRespaldo -and $fila.UltimoRespaldo -isnot [DBNull]) {
+                try { $respaldo = [datetime]$fila.UltimoRespaldo } catch { $respaldo = $null }
+            }
+            [void]$resultados.Add([PSCustomObject]@{
+                Instancia = $instancia
+                Nombre = [string]$fila.Nombre
+                Estado = [string]$fila.Estado
+                DatosAsignadosMB = [math]::Round([double]$fila.DatosAsignadosMB, 2)
+                DatosUsadosMB = [math]::Round([double]$fila.DatosUsadosMB, 2)
+                DatosLibresMB = [math]::Round([double]$fila.DatosLibresMB, 2)
+                UsoDatosPct = [math]::Round([double]$fila.UsoDatosPct, 1)
+                LogMB = [math]::Round([double]$fila.LogMB, 2)
+                LogUsadoPct = [math]::Round([double]$fila.LogUsadoPct, 1)
+                UltimoRespaldo = $respaldo
+            })
+        }
+    }
+    return @($resultados | Sort-Object DatosUsadosMB, DatosAsignadosMB -Descending | Select-Object -First 5)
+}
+
 function Get-DiagnosticoInteligenteCONTPAQi {
     $inicio = Get-Date
     $hallazgos = New-Object System.Collections.ArrayList
@@ -4839,7 +5468,7 @@ function Get-DiagnosticoInteligenteCONTPAQi {
         })
     }
 
-    Write-Log -Mensaje '[1/8] Identificando equipo y sistema operativo...' -Nivel PROGRESS
+    Write-Log -Mensaje '[1/9] Identificando equipo y sistema operativo...' -Nivel PROGRESS
     try {
         $so = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         $equipo = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
@@ -4860,7 +5489,7 @@ function Get-DiagnosticoInteligenteCONTPAQi {
             -Accion 'Ejecuta Toolbox como administrador y vuelve a generar el diagnostico.'
     }
 
-    Write-Log -Mensaje '[2/8] Revisando productos CONTPAQi instalados...' -Nivel PROGRESS
+    Write-Log -Mensaje '[2/9] Revisando productos CONTPAQi instalados...' -Nivel PROGRESS
     $productos = @(Get-ProgramasInstalados | Where-Object {
         $_.DisplayName -match '(?i)CONTPAQ|COMPAC|APPKEY|SACI|XML\s*EN\s*L[IÍ]NEA'
     } | Sort-Object DisplayName, DisplayVersion -Unique)
@@ -4874,7 +5503,34 @@ function Get-DiagnosticoInteligenteCONTPAQi {
             -Accion 'Confirma el rol del equipo y valida la instalacion desde Programas y caracteristicas.'
     }
 
-    Write-Log -Mensaje '[3/8] Validando servicios y ejecutables...' -Nivel PROGRESS
+    Write-Log -Mensaje '[3/9] Identificando Excel, arquitectura y licencia...' -Nivel PROGRESS
+    $excel = Get-MicrosoftExcelInfo
+    $inventario.Excel = $excel
+    if (-not $excel.Detectado) {
+        Add-DiagnosticoHallazgo -Severidad INFORMATIVA -Categoria 'Microsoft Excel' -Titulo 'Microsoft Excel no detectado' `
+            -Evidencia 'No se encontro EXCEL.EXE mediante las rutas registradas de Windows y Office.' `
+            -Consecuencia 'Las funciones de exportacion o integraciones que dependan de Excel pueden no estar disponibles.' `
+            -Accion 'Instala Excel solamente si los procesos del cliente lo requieren; para integraciones CONTPAQi, valida primero la edicion compatible.'
+    } elseif ($excel.Arquitectura -eq '64 bits') {
+        Add-DiagnosticoHallazgo -Severidad MEDIA -Categoria 'Microsoft Excel' -Titulo 'Excel de 64 bits detectado' `
+            -Evidencia "$($excel.Producto) | Version $($excel.Version) | $($excel.Arquitectura)." `
+            -Consecuencia 'Algunos complementos, SDK, reportes o integraciones heredadas de CONTPAQi pueden requerir Office de 32 bits.' `
+            -Accion 'Confirma los complementos utilizados. Si requieren 32 bits, respalda plantillas y configuracion, desinstala Office de 64 bits e instala la misma edicion de 32 bits con licencia valida.'
+    }
+    if ($excel.Detectado -and $excel.Licencia -notin @('ACTIVADA','NO SE PUDO CONFIRMAR')) {
+        Add-DiagnosticoHallazgo -Severidad ALTA -Categoria 'Microsoft Excel' -Titulo "Licencia de Office: $($excel.Licencia)" `
+            -Evidencia "$($excel.Producto) | Tipo: $($excel.TipoLicencia)." `
+            -Consecuencia 'Excel puede mostrar avisos, entrar en modo reducido o impedir edicion y automatizaciones.' `
+            -Accion 'Abre Excel con el usuario final, revisa Archivo > Cuenta y reactiva con la cuenta, MAK o servidor KMS autorizado.'
+    } elseif ($excel.Detectado -and $excel.Licencia -eq 'NO SE PUDO CONFIRMAR') {
+        Add-DiagnosticoHallazgo -Severidad INFORMATIVA -Categoria 'Microsoft Excel' -Titulo 'Activacion de Office no confirmada por Windows' `
+            -Evidencia "$($excel.Producto) esta instalado, pero SoftwareLicensingProduct no devolvio una licencia verificable." `
+            -Consecuencia 'No significa necesariamente que Office carezca de licencia; algunas suscripciones se validan por usuario.' `
+            -Accion 'Abre Excel con el usuario habitual y confirma Producto activado en Archivo > Cuenta.'
+    }
+    Write-Log -Mensaje "Excel: $($excel.Producto) | $($excel.Arquitectura) | Licencia $($excel.Licencia) | $($excel.Compatibilidad)." -Nivel $(if ($excel.Detectado -and $excel.Arquitectura -eq '32 bits' -and $excel.Licencia -eq 'ACTIVADA') { 'OK' } elseif ($excel.Detectado) { 'WARN' } else { 'INFO' })
+
+    Write-Log -Mensaje '[4/9] Validando servicios y ejecutables...' -Nivel PROGRESS
     $servicios = @(Get-ServiciosCONTPAQiDetectados)
     $inventario.Servicios = @($servicios | ForEach-Object { [PSCustomObject]@{
         Nombre = $_.Name; Descripcion = $_.DisplayName; Estado = [string]$_.Status; Inicio = [string]$_.StartType
@@ -4907,7 +5563,7 @@ function Get-DiagnosticoInteligenteCONTPAQi {
         } catch { }
     }
 
-    Write-Log -Mensaje '[4/8] Comprobando motores SQL Server...' -Nivel PROGRESS
+    Write-Log -Mensaje '[5/9] Comprobando motores SQL Server...' -Nivel PROGRESS
     $sqlResultados = New-Object System.Collections.ArrayList
     foreach ($motor in @(Get-ServiciosMotorSQL)) {
         $instancia = Get-NombreInstanciaSQL -NombreServicio $motor.Name
@@ -4927,8 +5583,15 @@ function Get-DiagnosticoInteligenteCONTPAQi {
         }
     }
     $inventario.SQL = @($sqlResultados)
+    $instanciasDisponibles = @($sqlResultados | Where-Object { $_.Estado -eq 'Disponible' } | ForEach-Object { [string]$_.Instancia })
+    $inventario.EmpresasPrincipales = @(Get-PrincipalesBasesDiagnosticoCONTPAQi -Instancias $instanciasDisponibles)
+    if ($inventario.EmpresasPrincipales.Count -gt 0) {
+        Write-Log -Mensaje "Empresas principales incluidas en el reporte: $($inventario.EmpresasPrincipales.Count)." -Nivel OK
+    } elseif ($instanciasDisponibles.Count -gt 0) {
+        Write-Log -Mensaje 'SQL esta disponible, pero no fue posible obtener empresas principales con los permisos actuales.' -Nivel WARN
+    }
 
-    Write-Log -Mensaje '[5/8] Midiendo almacenamiento...' -Nivel PROGRESS
+    Write-Log -Mensaje '[6/9] Midiendo almacenamiento...' -Nivel PROGRESS
     $discos = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object {
         $total = [double]$_.Size
         $libre = [double]$_.FreeSpace
@@ -4946,7 +5609,7 @@ function Get-DiagnosticoInteligenteCONTPAQi {
         }
     }
 
-    Write-Log -Mensaje '[6/8] Revisando red y resolucion local...' -Nivel PROGRESS
+    Write-Log -Mensaje '[7/9] Revisando red y resolucion local...' -Nivel PROGRESS
     $adaptadores = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue)
     $inventario.Red = @($adaptadores | ForEach-Object { [PSCustomObject]@{
         Adaptador = $_.Description; IP = (@($_.IPAddress | Where-Object { $_ -match '^\d+\.' }) -join ', ')
@@ -4964,7 +5627,7 @@ function Get-DiagnosticoInteligenteCONTPAQi {
             -Accion 'Confirma que sea una configuracion intencional; de lo contrario revisa DHCP o la IP estatica.'
     }
 
-    Write-Log -Mensaje '[7/8] Revisando temporales y reinicio pendiente...' -Nivel PROGRESS
+    Write-Log -Mensaje '[8/9] Revisando temporales y reinicio pendiente...' -Nivel PROGRESS
     $temporales = Get-TamanoCarpetasTemporalesCONTPAQi
     $inventario.TemporalesMB = $temporales.MB
     if ($temporales.MB -ge 2048) {
@@ -4973,16 +5636,24 @@ function Get-DiagnosticoInteligenteCONTPAQi {
             -Consecuencia 'Puede aumentar el tiempo de carga y consumir almacenamiento necesario para otras operaciones.' `
             -Accion 'Usa la limpieza segura de Toolbox fuera de procesos activos y conserva evidencia si existe una incidencia.'
     }
-    $reinicioPendiente = Test-ReinicioPendiente
-    $inventario.ReinicioPendiente = if ($reinicioPendiente) { 'SI' } else { 'NO' }
-    if ($reinicioPendiente) {
+    $estadoReinicio = Get-EstadoReinicioPendiente
+    $inventario.ReinicioPendiente = $estadoReinicio.Estado
+    if ($estadoReinicio.Pendiente) {
+        $evidenciaReinicio = @($estadoReinicio.Razones | ForEach-Object { "$($_.Fuente): $($_.Detalle)" }) -join ' | '
+        $accionesReinicio = @($estadoReinicio.Razones | ForEach-Object { $_.Accion } | Select-Object -Unique) -join ' '
         Add-DiagnosticoHallazgo -Severidad MEDIA -Categoria 'Windows' -Titulo 'Reinicio de Windows pendiente' `
-            -Evidencia 'Windows registra operaciones que requieren reinicio.' `
+            -Evidencia $evidenciaReinicio `
             -Consecuencia 'Servicios, actualizaciones o reparaciones pueden quedar aplicados parcialmente.' `
-            -Accion 'Programa un reinicio controlado y repite el diagnostico antes de escalar la incidencia.'
+            -Accion $accionesReinicio
+    } elseif ($estadoReinicio.OperacionesResiduales.Count -gt 0) {
+        $detalleResidual = @($estadoReinicio.OperacionesResiduales | Select-Object -First 6 | ForEach-Object { "$($_.Responsable): $($_.Detalle)" }) -join ' | '
+        Add-DiagnosticoHallazgo -Severidad INFORMATIVA -Categoria 'Windows' -Titulo 'Operaciones de archivo residuales; reinicio no confirmado' `
+            -Evidencia $detalleResidual `
+            -Consecuencia 'Esta señal puede permanecer despues de reiniciar y no reduce el puntaje de salud por si sola.' `
+            -Accion $estadoReinicio.AccionResidual
     }
 
-    Write-Log -Mensaje '[8/8] Correlacionando eventos recientes...' -Nivel PROGRESS
+    Write-Log -Mensaje '[9/9] Correlacionando eventos recientes...' -Nivel PROGRESS
     $eventos = @(Get-EventosCONTPAQiRecientes)
     $inventario.Eventos = @($eventos | Select-Object -First 8 | ForEach-Object {
         $mensaje = (($_.Message -replace '[\r\n]+', ' ') -replace '\s+', ' ').Trim()
@@ -5055,6 +5726,10 @@ function Export-DiagnosticoInteligentePdfCONTPAQi {
         })) -join "`n"
     }
     $productosHtml = if (@($Diagnostico.Inventario.Productos).Count) { (@($Diagnostico.Inventario.Productos | ForEach-Object { "<li>$((ConvertTo-HtmlSeguroCONTPAQi $_))</li>" })) -join '' } else { '<li>No detectados</li>' }
+    $excel = $Diagnostico.Inventario.Excel
+    $licenciaClase = if ($excel.Licencia -eq 'ACTIVADA') { 'ok-text' } elseif ($excel.Licencia -eq 'NO SE PUDO CONFIRMAR') { 'warning-text' } else { 'bad-text' }
+    $arquitecturaClase = if ($excel.Arquitectura -eq '32 bits') { 'ok-text' } elseif ($excel.Arquitectura -eq '64 bits') { 'warning-text' } else { '' }
+    $excelHtml = "<section class='office'><div class='office-title'>MICROSOFT EXCEL Y LICENCIA</div><div class='office-grid'><div><span>PRODUCTO</span><b>$((ConvertTo-HtmlSeguroCONTPAQi $excel.Producto))</b></div><div><span>VERSION</span><b>$((ConvertTo-HtmlSeguroCONTPAQi $excel.Version))</b></div><div><span>ARQUITECTURA</span><b class='$arquitecturaClase'>$((ConvertTo-HtmlSeguroCONTPAQi $excel.Arquitectura))</b></div><div><span>LICENCIA</span><b class='$licenciaClase'>$((ConvertTo-HtmlSeguroCONTPAQi $excel.Licencia))</b><small>$((ConvertTo-HtmlSeguroCONTPAQi $excel.TipoLicencia))</small></div><div><span>CONTPAQI</span><b class='$arquitecturaClase'>$((ConvertTo-HtmlSeguroCONTPAQi $excel.Compatibilidad))</b></div></div></section>"
     $serviciosHtml = (@($Diagnostico.Inventario.Servicios | ForEach-Object {
         $estadoClase = if ($_.Estado -eq 'Running') { 'ok-text' } else { 'bad-text' }
         "<tr><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Nombre))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Descripcion))</td><td class='$estadoClase'>$((ConvertTo-HtmlSeguroCONTPAQi $_.Estado))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Inicio))</td></tr>"
@@ -5068,19 +5743,36 @@ function Export-DiagnosticoInteligentePdfCONTPAQi {
         "<tr><td>$($_.Fecha.ToString('dd/MM/yyyy HH:mm'))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Origen))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Id))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Mensaje))</td></tr>"
     })) -join ''
     if (-not $eventosHtml) { $eventosHtml = "<tr><td colspan='4' class='ok-text'>Sin eventos relacionados en el periodo revisado.</td></tr>" }
+    $empresasPrincipales = @($Diagnostico.Inventario.EmpresasPrincipales | Select-Object -First 5)
+    $empresasHtml = (@($empresasPrincipales | ForEach-Object {
+        $estadoClase = if ($_.Estado -eq 'ONLINE') { 'ok-text' } else { 'bad-text' }
+        $usoClase = if ([double]$_.UsoDatosPct -ge 90) { 'bad-text' } elseif ([double]$_.UsoDatosPct -ge 80) { 'warning-text' } else { 'ok-text' }
+        $usoBarra = [math]::Max(0, [math]::Min(100, [int][math]::Round([double]$_.UsoDatosPct)))
+        $respaldoTexto = if ($_.UltimoRespaldo) { ([datetime]$_.UltimoRespaldo).ToString('dd/MM/yyyy HH:mm') } else { 'Sin registro o sin permiso' }
+        $usadoGB = [math]::Round([double]$_.DatosUsadosMB / 1024, 2)
+        $asignadoGB = [math]::Round([double]$_.DatosAsignadosMB / 1024, 2)
+        $libreGB = [math]::Round([double]$_.DatosLibresMB / 1024, 2)
+        $logGB = [math]::Round([double]$_.LogMB / 1024, 2)
+        "<tr class='company-row'><td><b class='company-name'>$((ConvertTo-HtmlSeguroCONTPAQi $_.Nombre))</b><small class='company-meta'>Instancia: $((ConvertTo-HtmlSeguroCONTPAQi $_.Instancia))</small></td><td class='$estadoClase'>$((ConvertTo-HtmlSeguroCONTPAQi $_.Estado))</td><td><b>$usadoGB GB</b><small class='company-meta'>de $asignadoGB GB | Log $logGB GB ($($_.LogUsadoPct)%)</small></td><td>$libreGB GB</td><td><b class='$usoClase'>$($_.UsoDatosPct)%</b><div class='mini-bar'><i class='$usoClase' style='width:$usoBarra%'></i></div></td><td>$((ConvertTo-HtmlSeguroCONTPAQi $respaldoTexto))</td></tr>"
+    })) -join ''
+    if (-not $empresasHtml) {
+        $empresasHtml = "<tr><td colspan='6'>No se obtuvo informacion de empresas. Ejecuta el diagnostico en el servidor SQL con un usuario de Windows que tenga acceso a las bases.</td></tr>"
+    }
     $criticas = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'CRITICA').Count
     $altas = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'ALTA').Count
     $medias = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'MEDIA').Count
     $html = @"
 <!doctype html><html lang='es'><head><meta charset='utf-8'><title>Diagnostico CONTPAQi</title><style>
-@page{size:A4;margin:13mm;background:#07070b}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#07070b;color:#e8eaf2;font:12px 'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{min-height:260mm}.header{display:flex;align-items:center;padding:18px 20px;background:linear-gradient(135deg,#0d0d14,#171126);border:1px solid #2a2040;border-bottom:3px solid #7c3aed}.logo{width:54px;height:54px;object-fit:contain;margin-right:16px}.brand h1{font-size:23px;margin:0;color:#a78bfa;letter-spacing:.3px}.brand p{margin:4px 0 0;color:#8990a3}.version{margin-left:auto;color:#a78bfa;background:#211634;padding:7px 11px}.summary{display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;gap:10px;margin:13px 0}.card{background:#111119;border:1px solid #272735;padding:13px;min-height:76px}.label{font-size:9px;font-weight:700;color:#9298aa;letter-spacing:.8px}.value{font-size:20px;font-weight:800;margin-top:7px;color:#f3f4f6}.purple{color:#9b6cff}.red{color:#ff5d73}.amber{color:#ffbf47}.green{color:#38e08f}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:#0e0e15;border:1px solid #252533;padding:12px;margin-bottom:14px}.meta div{color:#a7adbd}.meta b{color:#e8eaf2}.section-title{margin:18px 0 9px;padding:8px 10px;color:#a78bfa;background:#141020;border-left:4px solid #7c3aed;font-size:13px;letter-spacing:.4px;break-after:avoid}.finding{background:#101017;border:1px solid #272733;border-left:4px solid #6b7280;margin:0 0 9px;padding:11px 12px;break-inside:avoid}.finding.critical{border-left-color:#ff5d73}.finding.high{border-left-color:#ff8a5b}.finding.medium{border-left-color:#ffbf47}.finding.info,.finding.healthy{border-left-color:#38e08f}.finding-head{display:flex;gap:8px;align-items:center}.pill{font-size:8px;font-weight:800;padding:3px 7px;background:#2a2139;color:#c4b5fd}.category{font-size:9px;color:#9298aa}.finding-title{font-size:14px;font-weight:750;margin:7px 0 8px}.finding-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.finding-grid>div{border-top:1px solid #292938;padding-top:7px}.finding-grid b{font-size:8px;color:#a78bfa}.finding-grid p{margin:4px 0 0;color:#c9cdd8;line-height:1.35}.two-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{background:#101017;border:1px solid #272733;padding:10px;break-inside:avoid}.panel h3{font-size:10px;color:#a78bfa;margin:0 0 7px}.panel ul{margin:0;padding-left:16px;font-size:9.5px;line-height:1.2}.panel li{margin:1px 0}.disk{margin:0 0 9px}.disk-row{display:flex;justify-content:space-between;margin-bottom:4px}.bar{height:7px;background:#292938}.bar i{display:block;height:100%;background:linear-gradient(90deg,#6d28d9,#a78bfa)}small{color:#858b9d}table{width:100%;border-collapse:collapse;background:#101017;font-size:9px}th{color:#a78bfa;background:#181522;text-align:left}th,td{border:1px solid #292938;padding:6px;vertical-align:top}td{color:#c9cdd8}.ok-text{color:#38e08f}.bad-text{color:#ff5d73}.footer{margin-top:16px;padding-top:9px;border-top:1px solid #2a2040;color:#858b9d;font-size:9px;text-align:center}.note{background:#151122;border:1px solid #302346;padding:10px;color:#b9becb;line-height:1.4} @media print{html,body{background:#07070b}.page{min-height:auto}}
+@page{size:A4;margin:13mm;background:#07070b}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#07070b;color:#e8eaf2;font:12px 'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{min-height:260mm}.header{display:flex;align-items:center;padding:18px 20px;background:linear-gradient(135deg,#0d0d14,#171126);border:1px solid #2a2040;border-bottom:3px solid #7c3aed}.logo{width:54px;height:54px;object-fit:contain;margin-right:16px}.brand h1{font-size:23px;margin:0;color:#a78bfa;letter-spacing:.3px}.brand p{margin:4px 0 0;color:#8990a3}.version{margin-left:auto;color:#a78bfa;background:#211634;padding:7px 11px}.summary{display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;gap:10px;margin:13px 0}.card{background:#111119;border:1px solid #272735;padding:13px;min-height:76px}.label{font-size:9px;font-weight:700;color:#9298aa;letter-spacing:.8px}.value{font-size:20px;font-weight:800;margin-top:7px;color:#f3f4f6}.purple{color:#9b6cff}.red{color:#ff5d73}.amber{color:#ffbf47}.green{color:#38e08f}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:#0e0e15;border:1px solid #252533;padding:12px;margin-bottom:14px}.meta div{color:#a7adbd}.meta b{color:#e8eaf2}.section-title{margin:18px 0 9px;padding:8px 10px;color:#a78bfa;background:#141020;border-left:4px solid #7c3aed;font-size:13px;letter-spacing:.4px;break-after:avoid}.finding{background:#101017;border:1px solid #272733;border-left:4px solid #6b7280;margin:0 0 9px;padding:11px 12px;break-inside:avoid}.finding.critical{border-left-color:#ff5d73}.finding.high{border-left-color:#ff8a5b}.finding.medium{border-left-color:#ffbf47}.finding.info,.finding.healthy{border-left-color:#38e08f}.finding-head{display:flex;gap:8px;align-items:center}.pill{font-size:8px;font-weight:800;padding:3px 7px;background:#2a2139;color:#c4b5fd}.category{font-size:9px;color:#9298aa}.finding-title{font-size:14px;font-weight:750;margin:7px 0 8px}.finding-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.finding-grid>div{border-top:1px solid #292938;padding-top:7px}.finding-grid b{font-size:8px;color:#a78bfa}.finding-grid p{margin:4px 0 0;color:#c9cdd8;line-height:1.35}.office{background:#101017;border:1px solid #302841;margin:0 0 10px;break-inside:avoid}.office-title{padding:7px 10px;background:#181522;color:#a78bfa;font-size:9px;font-weight:800;letter-spacing:.5px}.office-grid{display:grid;grid-template-columns:1.35fr .75fr .75fr .9fr 1.15fr}.office-grid>div{padding:9px;border-right:1px solid #292938;min-width:0}.office-grid>div:last-child{border-right:0}.office-grid span{display:block;color:#858b9d;font-size:7px;font-weight:800;margin-bottom:4px}.office-grid b{display:block;font-size:9px;line-height:1.25;overflow-wrap:anywhere}.office-grid small{display:block;font-size:7px;margin-top:3px}.warning-text{color:#ffbf47}.two-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{background:#101017;border:1px solid #272733;padding:10px;break-inside:avoid}.panel h3{font-size:10px;color:#a78bfa;margin:0 0 7px}.panel ul{margin:0;padding-left:16px;font-size:9.5px;line-height:1.2}.panel li{margin:1px 0}.disk{margin:0 0 9px}.disk-row{display:flex;justify-content:space-between;margin-bottom:4px}.bar{height:7px;background:#292938}.bar i{display:block;height:100%;background:linear-gradient(90deg,#6d28d9,#a78bfa)}small{color:#858b9d}table{width:100%;border-collapse:collapse;background:#101017;font-size:9px}th{color:#a78bfa;background:#181522;text-align:left}th,td{border:1px solid #292938;padding:6px;vertical-align:top}td{color:#c9cdd8}.company-table{table-layout:fixed;font-size:7.8px}.company-table th,.company-table td{padding:4px;overflow-wrap:anywhere}.company-table th:nth-child(1){width:24%}.company-table th:nth-child(2){width:14%}.company-table th:nth-child(3){width:18%}.company-table th:nth-child(4){width:10%}.company-table th:nth-child(5){width:11%}.company-table th:nth-child(6){width:23%}.company-row{break-inside:avoid}.company-name{display:block;color:#e8eaf2;overflow-wrap:anywhere}.company-meta{display:block;margin-top:2px;font-size:6.5px;color:#858b9d;overflow-wrap:anywhere}.mini-bar{height:4px;margin-top:3px;background:#292938}.mini-bar i{display:block;height:100%;background:#38e08f}.mini-bar i.warning-text{background:#ffbf47}.mini-bar i.bad-text{background:#ff5d73}.ok-text{color:#38e08f}.bad-text{color:#ff5d73}.footer{margin-top:16px;padding-top:9px;border-top:1px solid #2a2040;color:#858b9d;font-size:9px;text-align:center}.note{background:#151122;border:1px solid #302346;padding:10px;color:#b9becb;line-height:1.4} @media print{html,body{background:#07070b}.page{min-height:auto}}
 </style></head><body><main class='page'>
 <header class='header'>$logoHtml<div class='brand'><h1>DIAGNOSTICO INTELIGENTE</h1><p>CONTPAQi Toolbox - Evaluacion tecnica de solo lectura</p></div><div class='version'>v$($Script:Version)</div></header>
 <section class='summary'><div class='card'><div class='label'>PUNTAJE GENERAL</div><div class='value purple'>$($Diagnostico.Puntaje) / 100</div></div><div class='card'><div class='label'>ESTADO</div><div class='value'>$((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Estado))</div></div><div class='card'><div class='label'>CRITICAS / ALTAS</div><div class='value red'>$criticas / $altas</div></div><div class='card'><div class='label'>ADVERTENCIAS</div><div class='value amber'>$medias</div></div></section>
 <section class='meta'><div><b>Equipo:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Equipo))</div><div><b>Perfil:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Perfil))</div><div><b>Generado:</b> $($Diagnostico.Generado.ToString('dd/MM/yyyy HH:mm:ss'))</div><div><b>Duracion:</b> $($Diagnostico.DuracionSegundos) segundos</div><div><b>Sistema:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Inventario.Sistema))</div><div><b>Reinicio pendiente:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Inventario.ReinicioPendiente))</div></section>
 <h2 class='section-title'>HALLAZGOS Y RECOMENDACIONES</h2>$hallazgosHtml
 <h2 class='section-title'>SERVICIOS RELACIONADOS</h2><table><thead><tr><th>Servicio</th><th>Descripcion</th><th>Estado</th><th>Inicio</th></tr></thead><tbody>$serviciosHtml</tbody></table>
-<h2 class='section-title'>INVENTARIO DEL EQUIPO</h2><section class='two-cols'><div class='panel'><h3>PRODUCTOS DETECTADOS</h3><ul>$productosHtml</ul></div><div class='panel'><h3>ALMACENAMIENTO</h3>$discosHtml</div></section>
+<h2 class='section-title'>INVENTARIO DEL EQUIPO</h2>$excelHtml
+<h2 class='section-title'>5 EMPRESAS PRINCIPALES POR ESPACIO UTILIZADO</h2><div class='note'>Se muestran bases principales de usuario; las bases auxiliares de contenido, metadata y catalogos tecnicos no se cuentan como empresas.</div><table class='company-table'><thead><tr><th>Empresa / instancia</th><th>Estado</th><th>Datos y log</th><th>Disponible</th><th>Uso</th><th>Ultimo respaldo</th></tr></thead><tbody>$empresasHtml</tbody></table>
+<section class='two-cols'><div class='panel'><h3>PRODUCTOS DETECTADOS</h3><ul>$productosHtml</ul></div><div class='panel'><h3>ALMACENAMIENTO</h3>$discosHtml</div></section>
 <h2 class='section-title'>EVENTOS RECIENTES</h2><table><thead><tr><th>Fecha</th><th>Origen</th><th>ID</th><th>Detalle</th></tr></thead><tbody>$eventosHtml</tbody></table>
 <h2 class='section-title'>INTERPRETACION</h2><div class='note'>Este reporte recopila evidencia sin modificar configuraciones. Las acciones son recomendaciones tecnicas y deben validarse de acuerdo con el rol del equipo, respaldos disponibles y ventana de mantenimiento. Despues de cualquier correccion, genera un nuevo diagnostico y realiza una prueba funcional dentro de CONTPAQi.</div>
 <footer class='footer'>CONTPAQi Toolbox v$($Script:Version) | $($Script:MarcaAgua) | Reporte $baseNombre</footer>
@@ -5171,6 +5863,314 @@ function Test-PuertoTCP {
     }
 }
 
+function Get-NmapExecutableCONTPAQi {
+    param([switch]$Actualizar)
+    if (-not $Actualizar -and $Script:NmapCache -and $Script:NmapCacheFecha -and
+        ((Get-Date) - $Script:NmapCacheFecha).TotalSeconds -lt 60) {
+        return $Script:NmapCache
+    }
+
+    $candidatos = @()
+    if ($env:CONTPAQI_NMAP_PATH) { $candidatos += $env:CONTPAQI_NMAP_PATH }
+    $comandoNmap = Get-Command nmap.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($comandoNmap) { $candidatos += $comandoNmap.Source }
+    $candidatos += @(
+        (Join-Path $env:ProgramFiles 'Nmap\nmap.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Nmap\nmap.exe')
+    )
+    if ($PSScriptRoot) { $candidatos += Join-Path $PSScriptRoot 'Nmap\nmap.exe' }
+    try {
+        $baseAplicacion = [IO.Path]::GetDirectoryName([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+        if ($baseAplicacion) { $candidatos += Join-Path $baseAplicacion 'Nmap\nmap.exe' }
+    } catch { }
+
+    $resultado = $null
+    foreach ($ruta in @($candidatos | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $ruta -PathType Leaf)) { continue }
+        try {
+            $salidaVersion = @(& $ruta --version 2>&1)
+            if ($LASTEXITCODE -ne 0) { continue }
+            $lineaVersion = [string]($salidaVersion | Where-Object { $_ -match '(?i)^Nmap version' } | Select-Object -First 1)
+            $version = if ($lineaVersion -match '(?i)Nmap version\s+([^\s]+)') { $matches[1] } else { 'Detectada' }
+            $resultado = [PSCustomObject]@{ Disponible = $true; Ruta = $ruta; Version = $version; Error = $null }
+            break
+        } catch { }
+    }
+    if (-not $resultado) {
+        $resultado = [PSCustomObject]@{
+            Disponible = $false; Ruta = $null; Version = $null
+            Error = 'Nmap no esta instalado. Se utilizara el motor TCP integrado.'
+        }
+    }
+    $Script:NmapCache = $resultado
+    $Script:NmapCacheFecha = Get-Date
+    return $resultado
+}
+
+function ConvertFrom-NmapXmlCONTPAQi {
+    param(
+        [Parameter(Mandatory)][string]$XmlText,
+        [int[]]$PuertosEsperados = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($XmlText)) { throw 'Nmap no genero contenido XML.' }
+
+    $settings = New-Object System.Xml.XmlReaderSettings
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
+    $settings.XmlResolver = $null
+    $stringReader = New-Object IO.StringReader($XmlText)
+    $reader = [Xml.XmlReader]::Create($stringReader, $settings)
+    $documento = New-Object Xml.XmlDocument
+    $documento.XmlResolver = $null
+    try { $documento.Load($reader) } finally { $reader.Dispose(); $stringReader.Dispose() }
+
+    $hostNode = $documento.SelectSingleNode('/nmaprun/host')
+    $estadoHostNode = if ($hostNode) { $hostNode.SelectSingleNode('status') } else { $null }
+    $resultados = New-Object System.Collections.Generic.List[object]
+    if ($hostNode) {
+        foreach ($puertoNode in @($hostNode.SelectNodes('ports/port'))) {
+            $estadoNode = $puertoNode.SelectSingleNode('state')
+            $servicioNode = $puertoNode.SelectSingleNode('service')
+            $servicio = if ($servicioNode) { [string]$servicioNode.GetAttribute('name') } else { '' }
+            $producto = if ($servicioNode) { [string]$servicioNode.GetAttribute('product') } else { '' }
+            $version = if ($servicioNode) { [string]$servicioNode.GetAttribute('version') } else { '' }
+            $extra = if ($servicioNode) { [string]$servicioNode.GetAttribute('extrainfo') } else { '' }
+            $resultados.Add([PSCustomObject]@{
+                Puerto = [int]$puertoNode.GetAttribute('portid')
+                Protocolo = [string]$puertoNode.GetAttribute('protocol')
+                Estado = $(if ($estadoNode) { [string]$estadoNode.GetAttribute('state') } else { 'unknown' })
+                Razon = $(if ($estadoNode) { [string]$estadoNode.GetAttribute('reason') } else { 'sin-respuesta' })
+                Servicio = $servicio; Producto = $producto; Version = $version; Extra = $extra
+                Metodo = $(if ($servicioNode) { [string]$servicioNode.GetAttribute('method') } else { '' })
+                Confianza = $(if ($servicioNode -and $servicioNode.HasAttribute('conf')) { [int]$servicioNode.GetAttribute('conf') } else { 0 })
+            })
+        }
+
+        # Nmap puede resumir en extraports los estados repetidos. Como el
+        # Toolbox conoce la lista solicitada, reconstruye cada puerto omitido.
+        $presentes = @($resultados | Select-Object -ExpandProperty Puerto)
+        $faltantes = @($PuertosEsperados | Where-Object { $_ -notin $presentes })
+        $extras = @($hostNode.SelectNodes('ports/extraports'))
+        if ($faltantes.Count -gt 0 -and $extras.Count -gt 0) {
+            $extraPrincipal = $extras | Sort-Object { [int]$_.GetAttribute('count') } -Descending | Select-Object -First 1
+            $razonExtraNode = $extraPrincipal.SelectSingleNode('extrareasons')
+            foreach ($puerto in $faltantes) {
+                $resultados.Add([PSCustomObject]@{
+                    Puerto = [int]$puerto; Protocolo = 'tcp'; Estado = [string]$extraPrincipal.GetAttribute('state')
+                    Razon = $(if ($razonExtraNode) { [string]$razonExtraNode.GetAttribute('reason') } else { 'sin-respuesta' })
+                    Servicio = ''; Producto = ''; Version = ''; Extra = ''; Metodo = ''; Confianza = 0
+                })
+            }
+        }
+    }
+    $runNode = $documento.SelectSingleNode('/nmaprun/runstats/finished')
+    return [PSCustomObject]@{
+        HostActivo = ($estadoHostNode -and $estadoHostNode.GetAttribute('state') -eq 'up')
+        EstadoHost = $(if ($estadoHostNode) { [string]$estadoHostNode.GetAttribute('state') } else { 'unknown' })
+        RazonHost = $(if ($estadoHostNode) { [string]$estadoHostNode.GetAttribute('reason') } else { 'sin-respuesta' })
+        Puertos = @($resultados | Sort-Object Puerto)
+        DuracionSegundos = $(if ($runNode -and $runNode.HasAttribute('elapsed')) { [double]::Parse($runNode.GetAttribute('elapsed'), [Globalization.CultureInfo]::InvariantCulture) } else { 0 })
+    }
+}
+
+function Invoke-EscaneoPuertosNmapCONTPAQi {
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][int[]]$Puertos,
+        [switch]$SinVersiones,
+        [ValidateRange(15, 180)][int]$TimeoutSegundos = 90
+    )
+    $nmap = Get-NmapExecutableCONTPAQi
+    if (-not $nmap.Disponible) {
+        return [PSCustomObject]@{ Disponible = $false; Correcto = $false; Motor = 'TCP integrado'; Puertos = @(); Error = $nmap.Error }
+    }
+    $hostSeguro = ConvertTo-HostServidorCONTPAQi -Valor $HostName
+    if (-not $hostSeguro) {
+        return [PSCustomObject]@{ Disponible = $true; Correcto = $false; Motor = 'Nmap'; Puertos = @(); Error = 'El host no es valido.' }
+    }
+    $listaPuertos = @($Puertos | Where-Object { $_ -ge 1 -and $_ -le 65535 } | Sort-Object -Unique)
+    if ($listaPuertos.Count -eq 0) {
+        return [PSCustomObject]@{ Disponible = $true; Correcto = $false; Motor = 'Nmap'; Puertos = @(); Error = 'No se proporcionaron puertos validos.' }
+    }
+
+    $directorioTemporal = Join-Path $env:TEMP 'CONTPAQiToolbox\Nmap'
+    if (-not (Test-Path -LiteralPath $directorioTemporal)) { New-Item -ItemType Directory -Path $directorioTemporal -Force | Out-Null }
+    $archivoXml = Join-Path $directorioTemporal ("scan_{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $opcionesVersion = if ($SinVersiones) { '' } else { '-sV --version-light' }
+        $argumentos = "-sT -Pn -n --reason $opcionesVersion -T4 --max-retries 2 --host-timeout 60s --no-stylesheet -p $($listaPuertos -join ',') -oX `"$archivoXml`" $hostSeguro"
+        $proceso = Invoke-ProcessResponsive -FilePath $nmap.Ruta -ArgumentList $argumentos `
+            -TimeoutSeconds $TimeoutSegundos -Activity "Nmap analizando $hostSeguro" -Hidden
+        if (-not $proceso.Correcto -or $proceso.ExitCode -ne 0) {
+            throw "Nmap termino con codigo $($proceso.ExitCode): $($proceso.Error)"
+        }
+        if (-not (Test-Path -LiteralPath $archivoXml -PathType Leaf)) { throw 'Nmap no genero el archivo XML esperado.' }
+        $xmlText = Get-Content -LiteralPath $archivoXml -Raw -ErrorAction Stop
+        $analisis = ConvertFrom-NmapXmlCONTPAQi -XmlText $xmlText -PuertosEsperados $listaPuertos
+        return [PSCustomObject]@{
+            Disponible = $true; Correcto = $true; Motor = "Nmap $($nmap.Version)"; RutaNmap = $nmap.Ruta
+            HostActivo = $analisis.HostActivo; EstadoHost = $analisis.EstadoHost; RazonHost = $analisis.RazonHost
+            Puertos = @($analisis.Puertos); DuracionSegundos = $analisis.DuracionSegundos; Error = $null
+        }
+    } catch {
+        return [PSCustomObject]@{ Disponible = $true; Correcto = $false; Motor = "Nmap $($nmap.Version)"; Puertos = @(); Error = $_.Exception.Message }
+    } finally {
+        if (Test-Path -LiteralPath $archivoXml) { Remove-Item -LiteralPath $archivoXml -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-CatalogoPuertosTerminalCONTPAQi {
+    return @(
+        [PSCustomObject]@{ Puerto = 135;  Grupo = 'Administracion'; Uso = 'RPC / inventario administrativo' },
+        [PSCustomObject]@{ Puerto = 445;  Grupo = 'Archivos'; Uso = 'SMB / carpetas compartidas' },
+        [PSCustomObject]@{ Puerto = 3389; Grupo = 'Administracion'; Uso = 'Escritorio remoto' },
+        [PSCustomObject]@{ Puerto = 1099; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones legado' },
+        [PSCustomObject]@{ Puerto = 1138; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
+        [PSCustomObject]@{ Puerto = 1139; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
+        [PSCustomObject]@{ Puerto = 1775; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
+        [PSCustomObject]@{ Puerto = 2003; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
+        [PSCustomObject]@{ Puerto = 9005; Grupo = 'Nominas'; Uso = 'Licenciamiento Nominas' },
+        [PSCustomObject]@{ Puerto = 9020; Grupo = 'Comercial/Factura'; Uso = 'Licenciamiento Comercial / Factura' },
+        [PSCustomObject]@{ Puerto = 9042; Grupo = 'XML en Linea'; Uso = 'Servicio XML en Linea' },
+        [PSCustomObject]@{ Puerto = 9047; Grupo = 'Contabilidad/Bancos'; Uso = 'Licenciamiento Contabilidad / Bancos' },
+        [PSCustomObject]@{ Puerto = 9079; Grupo = 'SACI/ADD'; Uso = 'SACI SSL' },
+        [PSCustomObject]@{ Puerto = 9080; Grupo = 'SACI/ADD'; Uso = 'SACI' },
+        [PSCustomObject]@{ Puerto = 9081; Grupo = 'SACI/ADD'; Uso = 'Administrador de Documentos Digitales' },
+        [PSCustomObject]@{ Puerto = 9082; Grupo = 'SACI/ADD'; Uso = 'Administrador de Documentos Digitales SSL' },
+        [PSCustomObject]@{ Puerto = 9083; Grupo = 'SACI/ADD'; Uso = 'SSCI' },
+        [PSCustomObject]@{ Puerto = 9084; Grupo = 'SACI/ADD'; Uso = 'SSCI SSL' },
+        [PSCustomObject]@{ Puerto = 9120; Grupo = 'Comercial/Factura'; Uso = 'AuthServer Comercial / Factura' },
+        [PSCustomObject]@{ Puerto = 9147; Grupo = 'Contabilidad/Bancos'; Uso = 'AuthServer Contabilidad / Bancos' },
+        [PSCustomObject]@{ Puerto = 1433; Grupo = 'SQL'; Uso = 'SQL Server TCP estatico' }
+    )
+}
+
+function Get-RequisitosTerminalCONTPAQi {
+    $nombresProductos = @(Get-ProgramasInstalados | Select-Object -ExpandProperty DisplayName) -join ' | '
+    $serviciosTerminal = @(Get-ServiciosTerminal)
+    $requisitos = New-Object System.Collections.Generic.List[object]
+    $requisitos.Add([PSCustomObject]@{ Grupo = 'Archivos SMB'; Puertos = @(445); Motivo = 'Acceso a carpetas compartidas del servidor' })
+
+    if ($nombresProductos -match '(?i)Contabilidad|Bancos' -or @($serviciosTerminal | Where-Object { $_.Id -eq 'V4' }).Count) {
+        $requisitos.Add([PSCustomObject]@{ Grupo = 'Contabilidad/Bancos'; Puertos = @(9047,9147); Motivo = 'Licenciamiento y AuthServer' })
+    }
+    if ($nombresProductos -match '(?i)Comercial|Factura') {
+        $requisitos.Add([PSCustomObject]@{ Grupo = 'Comercial/Factura'; Puertos = @(9020,9120); Motivo = 'Licenciamiento y AuthServer' })
+    }
+    if ($nombresProductos -match '(?i)N[oó]mina' -or @($serviciosTerminal | Where-Object { $_.Id -eq 'NOMINAS' }).Count) {
+        $requisitos.Add([PSCustomObject]@{ Grupo = 'Nominas'; Puertos = @(9005); Motivo = 'Licenciamiento de Nominas' })
+    }
+    if ($nombresProductos -match '(?i)XML' -or @($serviciosTerminal | Where-Object { $_.Id -match '^XML' }).Count) {
+        $requisitos.Add([PSCustomObject]@{ Grupo = 'XML en Linea'; Puertos = @(9042); Motivo = 'Servicio XML en Linea' })
+    }
+    if ($nombresProductos -match '(?i)CONTPAQ|COMPAC' -or $serviciosTerminal.Count -gt 0) {
+        $requisitos.Add([PSCustomObject]@{ Grupo = 'SACI/ADD'; Puertos = @(1099,1138,1139,1775,2003,9079,9080,9081,9082,9083,9084); Motivo = 'Servidor de aplicaciones y ADD' })
+    }
+    return @($requisitos | Group-Object Grupo | ForEach-Object { $_.Group[0] })
+}
+
+function Get-RutasServidorTerminalCONTPAQi {
+    param([Parameter(Mandatory)][string]$HostName)
+    $rutas = New-Object System.Collections.Generic.List[object]
+    $unicas = @{}
+    function Add-RutaTerminalInterna {
+        param([string]$Ruta, [string]$Origen, [bool]$Obligatoria = $true)
+        if ([string]::IsNullOrWhiteSpace($Ruta) -or $Ruta -notmatch '^\\\\([^\\]+)\\') { return }
+        $servidorRuta = ConvertTo-HostServidorCONTPAQi -Valor $matches[1]
+        $servidorObjetivo = ConvertTo-HostServidorCONTPAQi -Valor $HostName
+        if ($servidorRuta -and $servidorObjetivo -and $servidorRuta -ne $servidorObjetivo) { return }
+        $normalizada = $Ruta.TrimEnd('\')
+        $clave = $normalizada.ToLowerInvariant()
+        if (-not $unicas.ContainsKey($clave)) {
+            $unicas[$clave] = $true
+            $rutas.Add([PSCustomObject]@{ Ruta = $normalizada; Origen = $Origen; Obligatoria = $Obligatoria })
+        }
+    }
+
+    try {
+        foreach ($unidad in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=4' -ErrorAction SilentlyContinue)) {
+            if ($unidad.ProviderName) { Add-RutaTerminalInterna -Ruta $unidad.ProviderName -Origen "Unidad $($unidad.DeviceID)" }
+        }
+    } catch { }
+    if (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue) {
+        foreach ($mapeo in @(Get-SmbMapping -ErrorAction SilentlyContinue)) {
+            if ($mapeo.RemotePath) { Add-RutaTerminalInterna -Ruta $mapeo.RemotePath -Origen "Mapeo SMB $($mapeo.LocalPath)" }
+        }
+    }
+
+    # Recursos visibles para el usuario actual. Solo se agregan los que por
+    # nombre corresponden a CONTPAQi/Compac para evitar probar carpetas ajenas.
+    $codigoRecursos = @'
+param([string]$ServerName)
+$salida = @(& "$env:SystemRoot\System32\net.exe" view "\\$ServerName" 2>&1)
+$recursos = @()
+if ($LASTEXITCODE -eq 0) {
+    foreach ($linea in $salida) {
+        $texto = [string]$linea
+        if ($texto -match '^\s*(.+?)\s{2,}(?:Disk|Disco)\s*(?:\s{2,}.*)?$') {
+            $nombre = $matches[1].Trim()
+            if ($nombre -match '(?i)CONTPAQ|COMPAC') { $recursos += $nombre }
+        }
+    }
+}
+[PSCustomObject]@{ Correcto = ($LASTEXITCODE -eq 0); Recursos = @($recursos | Select-Object -Unique); Error = $(if ($LASTEXITCODE -eq 0) { $null } else { ($salida -join ' ') }) }
+'@
+    $recursosWorker = Invoke-ResponsiveWorker -ScriptText $codigoRecursos -Arguments @($HostName) -TimeoutSeconds 15 -Activity "Enumerando recursos de $HostName"
+    if ($recursosWorker.Correcto -and $recursosWorker.Resultado -and $recursosWorker.Resultado.Correcto) {
+        foreach ($recurso in @($recursosWorker.Resultado.Recursos)) {
+            Add-RutaTerminalInterna -Ruta "\\$HostName\$recurso" -Origen 'Recurso compartido visible'
+        }
+    }
+
+    # Rutas UNC guardadas directamente por productos CONTPAQi.
+    foreach ($raiz in @(
+        'HKLM:\SOFTWARE\WOW6432Node\Computación en Acción, SA CV',
+        'HKLM:\SOFTWARE\Computación en Acción, SA CV',
+        'HKCU:\SOFTWARE\Computación en Acción, SA CV'
+    )) {
+        if (-not (Test-Path -LiteralPath $raiz)) { continue }
+        foreach ($clave in @((Get-Item -LiteralPath $raiz -ErrorAction SilentlyContinue)) + @(Get-ChildItem -LiteralPath $raiz -Recurse -ErrorAction SilentlyContinue)) {
+            if (-not $clave) { continue }
+            foreach ($nombreValor in $clave.GetValueNames()) {
+                $valor = $clave.GetValue($nombreValor)
+                if ($valor -is [string] -and $valor -match '^\\\\[^\\]+\\[^\r\n]+') {
+                    Add-RutaTerminalInterna -Ruta $valor -Origen "Registro: $nombreValor"
+                }
+            }
+        }
+    }
+
+    # Si no hay rutas configuradas visibles, se prueban nombres comunes solo
+    # como referencia; su ausencia no se considera una falla por si sola.
+    if ($rutas.Count -eq 0) {
+        foreach ($recursoComun in @('Compac','Compacw','CONTPAQi')) {
+            Add-RutaTerminalInterna -Ruta "\\$HostName\$recursoComun" -Origen 'Nombre comun (opcional)' -Obligatoria $false
+        }
+    }
+    return @($rutas | ForEach-Object { $_ })
+}
+
+function Test-AccesoRutaServidorCONTPAQi {
+    param([Parameter(Mandatory)][string]$Ruta)
+    $codigo = @'
+param([string]$NetworkPath)
+try {
+    $item = Get-Item -LiteralPath $NetworkPath -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) { throw 'La ruta no es una carpeta.' }
+    $null = @(Get-ChildItem -LiteralPath $NetworkPath -Force -ErrorAction Stop | Select-Object -First 1)
+    [PSCustomObject]@{ Existe = $true; Lectura = $true; Error = $null }
+} catch [System.UnauthorizedAccessException] {
+    [PSCustomObject]@{ Existe = $true; Lectura = $false; Error = $_.Exception.Message }
+} catch {
+    [PSCustomObject]@{ Existe = $false; Lectura = $false; Error = $_.Exception.Message }
+}
+'@
+    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -Arguments @($Ruta) -TimeoutSeconds 15 -Activity "Validando $Ruta"
+    if (-not $worker.Correcto -or $worker.Timeout -or -not $worker.Resultado) {
+        return [PSCustomObject]@{ Existe = $false; Lectura = $false; Error = $(if ($worker.Error) { $worker.Error } else { 'Tiempo agotado.' }) }
+    }
+    return $worker.Resultado
+}
+
 function Resolve-HostCONTPAQi {
     param([Parameter(Mandatory)][string]$HostName)
     try {
@@ -5248,7 +6248,7 @@ function Find-ServidoresCONTPAQi {
         $claves += @(Get-ChildItem -LiteralPath $raiz -Recurse -ErrorAction SilentlyContinue)
         foreach ($clave in $claves) {
             foreach ($nombreValor in $clave.GetValueNames()) {
-                if ($nombreValor -notmatch '^(?i)(NOMBRESERVIDOR|SERVIDORIP|DIRECCIONIP)$') { continue }
+                if ($nombreValor -notmatch '^(?i)(NOMBRESERVIDOR|SERVERNAME|SERVIDOR|SERVIDORIP|IPSERVER|DIRECCIONIP|HOST)$') { continue }
                 $valor = [string]$clave.GetValue($nombreValor)
                 Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $valor -Evidencia "Registro $($clave.PSChildName): $nombreValor" -Puntos 75
             }
@@ -5278,6 +6278,32 @@ function Find-ServidoresCONTPAQi {
             foreach ($coincidencia in [regex]::Matches($textoConfig, '(?i)(?:key|name)="Saci"\s+value="([^"]+)"')) {
                 Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $coincidencia.Groups[1].Value -Evidencia 'Configuracion activa de SACI' -Puntos 90
             }
+        }
+    }
+
+    # Algunas versiones guardan los mismos archivos varios niveles debajo de
+    # Compac/ProgramData. Se limita la cantidad para no congelar equipos lentos.
+    $raicesConfiguracion = @(
+        $raicesCompac,
+        'C:\Compac', 'C:\Compacw',
+        (Join-Path $env:ProgramData 'Compac'), (Join-Path $env:ProgramData 'CONTPAQi')
+    ) | ForEach-Object { $_ } | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+    $archivosConfiguracion = New-Object System.Collections.Generic.List[object]
+    foreach ($raizConfiguracion in $raicesConfiguracion) {
+        foreach ($nombreArchivo in @('CompacCliente.properties','Contpaq.properties','ConfigurationClient.config')) {
+            foreach ($archivoConfig in @(Get-ChildItem -LiteralPath $raizConfiguracion -Filter $nombreArchivo -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 80)) {
+                if (-not @($archivosConfiguracion.FullName).Contains($archivoConfig.FullName)) { $archivosConfiguracion.Add($archivoConfig) }
+            }
+        }
+    }
+    foreach ($archivoConfig in $archivosConfiguracion) {
+        $textoConfig = Get-Content -LiteralPath $archivoConfig.FullName -Raw -ErrorAction SilentlyContinue
+        if (-not $textoConfig) { continue }
+        foreach ($coincidencia in [regex]::Matches($textoConfig, '(?im)^\s*(?:servidor\.(?:direccionIP|nombre)|servidor|server|host)\s*[=:]\s*["'']?([^\s"''#;<>]+)')) {
+            Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $coincidencia.Groups[1].Value -Evidencia "$($archivoConfig.Name) en $($archivoConfig.Directory.Name)" -Puntos 70
+        }
+        foreach ($coincidencia in [regex]::Matches($textoConfig, '(?i)(?:value|address)\s*=\s*"(?:https?://)?([A-Za-z0-9][A-Za-z0-9._-]{0,252})(?::\d+)?(?:/[^" ]*)?"')) {
+            Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $coincidencia.Groups[1].Value -Evidencia "Endpoint en $($archivoConfig.Name)" -Puntos 55
         }
     }
 
@@ -5319,6 +6345,22 @@ function Find-ServidoresCONTPAQi {
             $partes = @($valorAlias -split ',')
             $servidorAlias = if ($partes.Count -ge 2) { $partes[1] } else { $nombreAlias }
             Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $servidorAlias -Evidencia "Alias SQL $nombreAlias" -Puntos 30
+        }
+    }
+
+    # DSN ODBC usados por instalaciones antiguas o integraciones locales.
+    foreach ($rutaOdbc in @(
+        'HKLM:\SOFTWARE\ODBC\ODBC.INI',
+        'HKLM:\SOFTWARE\WOW6432Node\ODBC\ODBC.INI',
+        'HKCU:\SOFTWARE\ODBC\ODBC.INI'
+    )) {
+        foreach ($dsn in @(Get-ChildItem -LiteralPath $rutaOdbc -ErrorAction SilentlyContinue)) {
+            foreach ($nombreValor in @('Server','SERVER','Address','Network Address')) {
+                $valorServidor = [string]$dsn.GetValue($nombreValor)
+                if ($valorServidor) {
+                    Add-CandidatoServidorCONTPAQi -Mapa $mapa -HostName $valorServidor -Evidencia "DSN ODBC $($dsn.PSChildName)" -Puntos 35
+                }
+            }
         }
     }
 
@@ -5633,22 +6675,121 @@ function Get-InventarioServidorCONTPAQi {
         }
         $so = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
         $windows = if ($so) { [PSCustomObject]@{ Producto = $so.Caption; Version = $so.Version; Compilacion = $so.BuildNumber } } else { $null }
-        return [PSCustomObject]@{ Acceso = $true; EsLocal = $true; Windows = $windows; Programas = $programas; Servicios = $servicios; SQL = $sql; Error = $null }
+        return [PSCustomObject]@{
+            Acceso = $true; AccesoParcial = $false; EsLocal = $true; Windows = $windows
+            Programas = $programas; Servicios = $servicios; SQL = $sql; Error = $null
+            Errores = @(); Fuentes = @('Inventario local'); PuertosAdministrativos = @()
+        }
     }
 
     $rpc = Test-PuertoTCP -HostName $HostName -Port 135 -TimeoutMs 900
     $smb = Test-PuertoTCP -HostName $HostName -Port 445 -TimeoutMs 900
-    if (-not $rpc.Abierto -and -not $smb.Abierto) {
-        return [PSCustomObject]@{ Acceso = $false; EsLocal = $false; Windows = $null; Programas = @(); Servicios = @(); SQL = @(); Error = 'Los puertos administrativos RPC/SMB (135/445) no responden; no es posible consultar el registro remoto.' }
-    }
+    $winrmHttp = Test-PuertoTCP -HostName $HostName -Port 5985 -TimeoutMs 700
+    $winrmHttps = Test-PuertoTCP -HostName $HostName -Port 5986 -TimeoutMs 700
+    $puertosAdministrativos = @()
+    if ($rpc.Abierto) { $puertosAdministrativos += 135 }
+    if ($smb.Abierto) { $puertosAdministrativos += 445 }
+    if ($winrmHttp.Abierto) { $puertosAdministrativos += 5985 }
+    if ($winrmHttps.Abierto) { $puertosAdministrativos += 5986 }
+
+    $errores = New-Object System.Collections.Generic.List[string]
+    $fuentes = New-Object System.Collections.Generic.List[string]
+    $windows = $null
+    $programas = @()
+    $servicios = @()
+    $sql = @()
+    $sesionCim = $null
+
     try {
-        $windows = Get-DatosWindowsRemotosCONTPAQi -HostName $HostName
-        $programas = @(Get-ProgramasRemotosCONTPAQi -HostName $HostName)
-        $servicios = @(Get-ServiciosRemotosCONTPAQi -HostName $HostName)
-        $sql = @(Get-InstanciasSQLRemotasCONTPAQi -HostName $HostName)
-        return [PSCustomObject]@{ Acceso = $true; EsLocal = $false; Windows = $windows; Programas = $programas; Servicios = $servicios; SQL = $sql; Error = $null }
-    } catch {
-        return [PSCustomObject]@{ Acceso = $false; EsLocal = $false; Windows = $null; Programas = @(); Servicios = @(); SQL = @(); Error = $_.Exception.Message }
+        # DCOM suele estar disponible aun cuando WinRM no esta configurado. Si
+        # no funciona, se intenta WSMan. El inventario no depende de una sola via.
+        if ($rpc.Abierto) {
+            try {
+                $opcionesCim = New-CimSessionOption -Protocol Dcom
+                $sesionCim = New-CimSession -ComputerName $HostName -SessionOption $opcionesCim -OperationTimeoutSec 8 -ErrorAction Stop
+                $fuentes.Add('CIM/DCOM')
+            } catch { $errores.Add("CIM/DCOM: $($_.Exception.Message)") }
+        }
+        if (-not $sesionCim -and ($winrmHttp.Abierto -or $winrmHttps.Abierto)) {
+            try {
+                $sesionCim = New-CimSession -ComputerName $HostName -OperationTimeoutSec 8 -ErrorAction Stop
+                $fuentes.Add('CIM/WSMan')
+            } catch { $errores.Add("CIM/WSMan: $($_.Exception.Message)") }
+        }
+
+        if ($rpc.Abierto -or $smb.Abierto) {
+            try {
+                $windows = Get-DatosWindowsRemotosCONTPAQi -HostName $HostName
+                if ($windows) { $fuentes.Add('Registro remoto de Windows') }
+            } catch { $errores.Add("Windows/Registro remoto: $($_.Exception.Message)") }
+            try {
+                $programas = @(Get-ProgramasRemotosCONTPAQi -HostName $HostName)
+                $fuentes.Add('Programas/Registro remoto')
+            } catch { $errores.Add("Programas instalados: $($_.Exception.Message)") }
+            try {
+                $servicios = @(Get-ServiciosRemotosCONTPAQi -HostName $HostName)
+                if ($servicios.Count -gt 0) { $fuentes.Add('Servicios remotos') }
+            } catch { $errores.Add("Servicios/Registro remoto: $($_.Exception.Message)") }
+            try {
+                $sql = @(Get-InstanciasSQLRemotasCONTPAQi -HostName $HostName)
+                if ($sql.Count -gt 0) { $fuentes.Add('Instancias SQL/Registro remoto') }
+            } catch { $errores.Add("Instancias SQL: $($_.Exception.Message)") }
+        } else {
+            $errores.Add('RPC/SMB no disponibles; el Registro remoto no se pudo consultar.')
+        }
+
+        # Recuperacion parcial por CIM: una clase fallida no elimina las demas.
+        if ($sesionCim) {
+            if (-not $windows) {
+                try {
+                    $soCim = Get-CimInstance -ClassName Win32_OperatingSystem -CimSession $sesionCim -OperationTimeoutSec 10 -ErrorAction Stop
+                    $windows = [PSCustomObject]@{ Producto = $soCim.Caption; Version = $soCim.Version; Compilacion = $soCim.BuildNumber }
+                } catch { $errores.Add("Windows/CIM: $($_.Exception.Message)") }
+            }
+            if ($servicios.Count -eq 0) {
+                try {
+                    $servicios = @(Get-CimInstance -ClassName Win32_Service -CimSession $sesionCim -OperationTimeoutSec 12 -ErrorAction Stop | Where-Object {
+                        $_.Name -eq 'MSSQLSERVER' -or $_.Name -match '^MSSQL\$[^$]+$' -or
+                        "$($_.Name) $($_.DisplayName) $($_.PathName)" -match '(?i)CONTPAQ|COMPAC|SACI|APPKEY|XMLSERVICE|AUTHSERVER|SQLSERVERAGENT|SQLBROWSER|SQLWRITER'
+                    } | ForEach-Object {
+                        $esMotor = ($_.Name -eq 'MSSQLSERVER' -or $_.Name -match '^MSSQL\$[^$]+$')
+                        [PSCustomObject]@{
+                            Nombre = $_.Name; DisplayName = $_.DisplayName; Estado = $_.State
+                            Inicio = $_.StartMode; ImagePath = $_.PathName; EsMotorSQL = $esMotor
+                            Fabricante = Get-FabricanteServicioCONTPAQi -Nombre $_.Name -DisplayName $_.DisplayName -Ruta $_.PathName -EsMotorSQL $esMotor
+                        }
+                    } | Sort-Object Nombre -Unique)
+                    if ($servicios.Count -gt 0) { $fuentes.Add('Servicios/CIM') }
+                } catch { $errores.Add("Servicios/CIM: $($_.Exception.Message)") }
+            }
+        } elseif (-not $rpc.Abierto -and -not $winrmHttp.Abierto -and -not $winrmHttps.Abierto) {
+            $errores.Add('No hay un canal de administracion CIM disponible (135, 5985 o 5986).')
+        }
+
+        # Incluso sin acceso al registro SQL, los nombres de servicio permiten
+        # entregar las instancias detectadas en vez de una seccion vacia.
+        if ($sql.Count -eq 0) {
+            foreach ($motor in @($servicios | Where-Object { $_.EsMotorSQL })) {
+                $nombreServicio = [string]$motor.Nombre
+                $instancia = if ($nombreServicio -eq 'MSSQLSERVER') { $HostName } else { "$HostName\$($nombreServicio.Substring(6))" }
+                $sql += [PSCustomObject]@{
+                    Instancia = $instancia; Servicio = $nombreServicio
+                    Version = 'No consultada'; Edicion = 'Detectada por servicio'
+                }
+            }
+            if ($sql.Count -gt 0) { $fuentes.Add('Instancias inferidas por servicios') }
+        }
+    } finally {
+        if ($sesionCim) { Remove-CimSession -CimSession $sesionCim -ErrorAction SilentlyContinue }
+    }
+
+    $hayDatos = ($null -ne $windows -or $programas.Count -gt 0 -or $servicios.Count -gt 0 -or $sql.Count -gt 0)
+    $mensajeError = if ($errores.Count -gt 0) { $errores -join ' | ' } else { $null }
+    return [PSCustomObject]@{
+        Acceso = $hayDatos; AccesoParcial = ($hayDatos -and $errores.Count -gt 0); EsLocal = $false
+        Windows = $windows; Programas = @($programas); Servicios = @($servicios); SQL = @($sql)
+        Error = $mensajeError; Errores = @($errores); Fuentes = @($fuentes | Select-Object -Unique)
+        PuertosAdministrativos = @($puertosAdministrativos)
     }
 }
 
@@ -5666,7 +6807,7 @@ function Write-InventarioServidorCONTPAQi {
         if ($detalle.Length -gt 260) { $detalle = $detalle.Substring(0, 260) + '...' }
         Write-Log -Mensaje 'El servidor responde, pero Windows no permitio leer su inventario administrativo.' -Nivel WARN
         if ($detalle) { Write-Log -Mensaje "Detalle: $detalle" -Nivel INFO }
-        Write-Log -Mensaje 'Usa una cuenta administradora del servidor y habilita temporalmente Registro remoto/RPC, o ejecuta el Toolbox directamente en ese servidor.' -Nivel INFO
+        Write-Log -Mensaje 'Usa una cuenta administradora del servidor y habilita Registro remoto, RPC/DCOM o WinRM, o ejecuta el Toolbox directamente en ese servidor.' -Nivel INFO
         if (1433 -in $PuertosAbiertos) {
             $sqlDirecto = Test-ConexionSQLLocal -Instancia $HostName -TimeoutSegundos 4
             if ($sqlDirecto.Correcto) {
@@ -5676,7 +6817,11 @@ function Write-InventarioServidorCONTPAQi {
             }
         }
     } else {
-        Write-Log -Mensaje $(if ($inventario.EsLocal) { 'Inventario local disponible.' } else { 'Inventario remoto autorizado correctamente.' }) -Nivel OK
+        $mensajeAcceso = if ($inventario.EsLocal) { 'Inventario local disponible.' } elseif ($inventario.AccesoParcial) { 'Inventario remoto parcial: se conservaron todas las fuentes que si respondieron.' } else { 'Inventario remoto autorizado correctamente.' }
+        Write-Log -Mensaje $mensajeAcceso -Nivel $(if ($inventario.AccesoParcial) { 'WARN' } else { 'OK' })
+        if (@($inventario.Fuentes).Count -gt 0) {
+            Write-Log -Mensaje "Fuentes disponibles: $(@($inventario.Fuentes) -join ', ')." -Nivel INFO
+        }
         if ($inventario.Windows) {
             Write-Log -Mensaje "Windows: $($inventario.Windows.Producto) | Version $($inventario.Windows.Version) | Build $($inventario.Windows.Compilacion)" -Nivel INFO
         }
@@ -5707,6 +6852,12 @@ function Write-InventarioServidorCONTPAQi {
         $resumenFabricantes = @($gruposSistemas | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ' | '
         Write-Log -Mensaje "Resumen sistemas: $resumenFabricantes" -Nivel INFO
         Write-Log -Mensaje "Resumen tecnico: $($inventario.Servicios.Count) servicio(s), $($inventario.SQL.Count) instancia(s) SQL." -Nivel INFO
+        foreach ($errorFuente in @($inventario.Errores)) {
+            if ([string]::IsNullOrWhiteSpace([string]$errorFuente)) { continue }
+            $detalleFuente = ([string]$errorFuente -replace '[\r\n]+', ' ' -replace '\s+', ' ').Trim()
+            if ($detalleFuente.Length -gt 300) { $detalleFuente = $detalleFuente.Substring(0, 300) + '...' }
+            Write-Log -Mensaje "Fuente no disponible: $detalleFuente" -Nivel WARN
+        }
     }
 
     if ($PuertosAbiertos.Count -gt 0) {
@@ -5728,41 +6879,210 @@ function Write-InventarioServidorCONTPAQi {
 function Get-InfraestructuraServidorCONTPAQi {
     param([Parameter(Mandatory)][string]$HostName)
     $sesionCim = $null
+    $errores = New-Object System.Collections.Generic.List[string]
+    $protocolo = 'Local'
+    $argumentosCim = @{ ErrorAction = 'Stop' }
     try {
-        $argumentosCim = @{ ErrorAction = 'Stop' }
         if (-not (Test-HostCONTPAQiEsLocal -HostName $HostName)) {
-            $opcionesCim = New-CimSessionOption -Protocol Dcom
-            $sesionCim = New-CimSession -ComputerName $HostName -SessionOption $opcionesCim -OperationTimeoutSec 7 -ErrorAction Stop
+            try {
+                $opcionesCim = New-CimSessionOption -Protocol Dcom
+                $sesionCim = New-CimSession -ComputerName $HostName -SessionOption $opcionesCim -OperationTimeoutSec 8 -ErrorAction Stop
+                $protocolo = 'DCOM'
+            } catch {
+                $errores.Add("Sesion DCOM: $($_.Exception.Message)")
+                try {
+                    $sesionCim = New-CimSession -ComputerName $HostName -OperationTimeoutSec 8 -ErrorAction Stop
+                    $protocolo = 'WSMan'
+                } catch { $errores.Add("Sesion WSMan: $($_.Exception.Message)") }
+            }
+            if (-not $sesionCim) {
+                return [PSCustomObject]@{
+                    Acceso = $false; AccesoParcial = $false; Error = ($errores -join ' | '); Errores = @($errores)
+                    Protocolo = 'No disponible'; Nombre = $HostName; Dominio = ''; Fabricante = ''; Modelo = ''; RAMGB = 0
+                    SistemaOperativo = ''; VersionSO = ''; BuildSO = ''; UltimoArranque = $null
+                    Procesadores = @(); Discos = @(); Red = @(); Recursos = @()
+                }
+            }
             $argumentosCim.CimSession = $sesionCim
         }
-        $so = Get-CimInstance -ClassName Win32_OperatingSystem @argumentosCim
-        $equipo = Get-CimInstance -ClassName Win32_ComputerSystem @argumentosCim
-        $procesadores = @(Get-CimInstance -ClassName Win32_Processor @argumentosCim)
-        $discos = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' @argumentosCim)
-        $red = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' @argumentosCim)
-        $recursos = @(Get-CimInstance -ClassName Win32_Share @argumentosCim | Where-Object { $_.Name -notmatch '\$$' } | Select-Object -First 30)
+
+        $so = $null; $equipo = $null; $procesadores = @(); $discos = @(); $red = @(); $recursos = @()
+        try { $so = Get-CimInstance -ClassName Win32_OperatingSystem @argumentosCim } catch { $errores.Add("Sistema operativo: $($_.Exception.Message)") }
+        try { $equipo = Get-CimInstance -ClassName Win32_ComputerSystem @argumentosCim } catch { $errores.Add("Equipo/RAM: $($_.Exception.Message)") }
+        try { $procesadores = @(Get-CimInstance -ClassName Win32_Processor @argumentosCim) } catch { $errores.Add("Procesadores: $($_.Exception.Message)") }
+        try { $discos = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' @argumentosCim) } catch { $errores.Add("Discos: $($_.Exception.Message)") }
+        try { $red = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' @argumentosCim) } catch { $errores.Add("Adaptadores de red: $($_.Exception.Message)") }
+        try { $recursos = @(Get-CimInstance -ClassName Win32_Share @argumentosCim | Where-Object { $_.Name -notmatch '\$$' } | Select-Object -First 30) } catch { $errores.Add("Recursos compartidos: $($_.Exception.Message)") }
+
+        $hayDatos = ($null -ne $so -or $null -ne $equipo -or $procesadores.Count -gt 0 -or $discos.Count -gt 0 -or $red.Count -gt 0 -or $recursos.Count -gt 0)
         return [PSCustomObject]@{
-            Acceso = $true
-            Error = $null
-            Nombre = $equipo.Name
-            Dominio = $equipo.Domain
-            Fabricante = $equipo.Manufacturer
-            Modelo = $equipo.Model
-            RAMGB = [math]::Round([double]$equipo.TotalPhysicalMemory / 1GB, 1)
-            SistemaOperativo = $so.Caption
-            VersionSO = $so.Version
-            BuildSO = $so.BuildNumber
-            UltimoArranque = $so.LastBootUpTime
-            Procesadores = $procesadores
-            Discos = $discos
-            Red = $red
-            Recursos = $recursos
+            Acceso = $hayDatos; AccesoParcial = ($hayDatos -and $errores.Count -gt 0)
+            Error = $(if ($errores.Count) { $errores -join ' | ' } else { $null }); Errores = @($errores); Protocolo = $protocolo
+            Nombre = $(if ($equipo) { $equipo.Name } else { $HostName })
+            Dominio = $(if ($equipo) { $equipo.Domain } else { '' })
+            Fabricante = $(if ($equipo) { $equipo.Manufacturer } else { '' })
+            Modelo = $(if ($equipo) { $equipo.Model } else { '' })
+            RAMGB = $(if ($equipo) { [math]::Round([double]$equipo.TotalPhysicalMemory / 1GB, 1) } else { 0 })
+            SistemaOperativo = $(if ($so) { $so.Caption } else { '' })
+            VersionSO = $(if ($so) { $so.Version } else { '' })
+            BuildSO = $(if ($so) { $so.BuildNumber } else { '' })
+            UltimoArranque = $(if ($so) { $so.LastBootUpTime } else { $null })
+            Procesadores = @($procesadores); Discos = @($discos); Red = @($red); Recursos = @($recursos)
         }
     } catch {
-        return [PSCustomObject]@{ Acceso = $false; Error = $_.Exception.Message }
+        $errores.Add($_.Exception.Message)
+        return [PSCustomObject]@{
+            Acceso = $false; AccesoParcial = $false; Error = ($errores -join ' | '); Errores = @($errores)
+            Protocolo = $protocolo; Nombre = $HostName; Dominio = ''; Fabricante = ''; Modelo = ''; RAMGB = 0
+            SistemaOperativo = ''; VersionSO = ''; BuildSO = ''; UltimoArranque = $null
+            Procesadores = @(); Discos = @(); Red = @(); Recursos = @()
+        }
     } finally {
         if ($sesionCim) { Remove-CimSession -CimSession $sesionCim -ErrorAction SilentlyContinue }
     }
+}
+
+function Invoke-DiagnosticoTerminalServidorCONTPAQi {
+    Write-Encabezado -Titulo 'VALIDACION TERMINAL HACIA SERVIDOR' -Subtitulo 'DNS + puertos + firewall + carpetas + licencias locales' -Color $Script:ColorTerminal
+    Write-Log -Mensaje 'Diagnostico de solo lectura desde esta terminal. No se modificaran carpetas, servicios ni configuraciones.' -Nivel INFO
+    $inicio = Get-Date
+    $incidencias = 0
+    $advertencias = 0
+
+    $hostObjetivo = Select-ServidorObjetivoCONTPAQi
+    if ([string]::IsNullOrWhiteSpace($hostObjetivo)) {
+        Write-Log -Mensaje 'Validacion cancelada.' -Nivel WARN
+        return
+    }
+    $hostObjetivo = ConvertTo-HostServidorCONTPAQi -Valor $hostObjetivo
+    if (-not $hostObjetivo) {
+        Write-Log -Mensaje 'El nombre o IP del servidor no es valido.' -Nivel ERROR
+        return
+    }
+
+    Write-SeccionMenu -Titulo '1. IDENTIDAD Y RESOLUCION' -Color 'Cyan'
+    $direcciones = @(Resolve-HostCONTPAQi -HostName $hostObjetivo)
+    if ($direcciones.Count -gt 0) {
+        Write-Log -Mensaje "Servidor $hostObjetivo resuelto como $($direcciones -join ', ')." -Nivel OK
+    } elseif ($hostObjetivo -match '^\d{1,3}(?:\.\d{1,3}){3}$') {
+        Write-Log -Mensaje "Se utilizara directamente la IP $hostObjetivo." -Nivel OK
+    } else {
+        $incidencias++
+        Write-Log -Mensaje "DNS no puede resolver $hostObjetivo. Revisa DNS, VPN, sufijo de dominio o el nombre configurado en CONTPAQi." -Nivel ERROR
+    }
+
+    Write-SeccionMenu -Titulo '2. PUERTOS NECESARIOS DESDE ESTA TERMINAL' -Color 'Magenta'
+    $catalogo = @(Get-CatalogoPuertosTerminalCONTPAQi)
+    $requisitos = @(Get-RequisitosTerminalCONTPAQi)
+    if ($requisitos.Count -eq 1) {
+        $advertencias++
+        Write-Log -Mensaje 'No se identifico con precision el producto CONTPAQi instalado; se revisara el catalogo completo y SMB.' -Nivel WARN
+    } else {
+        foreach ($requisito in $requisitos) {
+            Write-Log -Mensaje "Requisito detectado: $($requisito.Grupo) | $($requisito.Motivo) | TCP $($requisito.Puertos -join '/')." -Nivel INFO
+        }
+    }
+
+    $resultadosPuertos = @()
+    $nmapInfo = Get-NmapExecutableCONTPAQi
+    $nmapScan = $null
+    if ($nmapInfo.Disponible) {
+        $nmapScan = Invoke-EscaneoPuertosNmapCONTPAQi -HostName $hostObjetivo `
+            -Puertos @($catalogo | Select-Object -ExpandProperty Puerto) -TimeoutSegundos 90
+    }
+    if ($nmapScan -and $nmapScan.Correcto) {
+        Write-Log -Mensaje "Motor: $($nmapScan.Motor) | $($nmapScan.DuracionSegundos) segundos." -Nivel OK
+        $resultadosPuertos = @($nmapScan.Puertos)
+        foreach ($puerto in $resultadosPuertos) {
+            $catalogado = $catalogo | Where-Object Puerto -eq $puerto.Puerto | Select-Object -First 1
+            $uso = if ($catalogado) { $catalogado.Uso } else { 'Servicio no catalogado' }
+            $identidad = @($puerto.Servicio,$puerto.Producto,$puerto.Version) | Where-Object { $_ }
+            $detalleIdentidad = if ($identidad.Count) { " | $($identidad -join ' ')" } else { '' }
+            $nivel = if ($puerto.Estado -eq 'open') { 'OK' } elseif ($puerto.Estado -match 'filtered') { 'WARN' } else { 'INFO' }
+            Write-Log -Mensaje "TCP $($puerto.Puerto) $($puerto.Estado.ToUpper()) | $uso | $($puerto.Razon)$detalleIdentidad" -Nivel $nivel
+        }
+    } else {
+        $motivo = if ($nmapScan) { $nmapScan.Error } else { $nmapInfo.Error }
+        Write-Log -Mensaje "Nmap no disponible: $motivo" -Nivel INFO
+        Write-Log -Mensaje 'Motor TCP integrado activo; confirma aperturas, pero un puerto sin respuesta puede estar cerrado o filtrado.' -Nivel INFO
+        foreach ($item in $catalogo) {
+            $prueba = Test-PuertoTCP -HostName $hostObjetivo -Port $item.Puerto -TimeoutMs 500
+            $resultadosPuertos += [PSCustomObject]@{
+                Puerto = $item.Puerto; Protocolo = 'tcp'; Estado = $(if ($prueba.Abierto) { 'open' } else { 'unknown' })
+                Razon = $prueba.Detalle; Servicio = ''; Producto = ''; Version = ''; Extra = ''; Metodo = 'TCP'; Confianza = 0
+            }
+            if ($prueba.Abierto) { Write-Log -Mensaje "TCP $($item.Puerto) ABIERTO | $($item.Uso) | $($prueba.Milisegundos) ms" -Nivel OK }
+            Refresh-Log
+        }
+    }
+
+    foreach ($requisito in $requisitos) {
+        $estadosGrupo = @($resultadosPuertos | Where-Object { $_.Puerto -in $requisito.Puertos })
+        $abiertosGrupo = @($estadosGrupo | Where-Object Estado -eq 'open')
+        if ($abiertosGrupo.Count -gt 0) {
+            Write-Log -Mensaje "[$($requisito.Grupo)] Disponible por TCP $($abiertosGrupo.Puerto -join ', ')." -Nivel OK
+            continue
+        }
+        $filtrados = @($estadosGrupo | Where-Object { $_.Estado -match 'filtered' })
+        $incidencias++
+        if ($filtrados.Count -gt 0) {
+            Write-Log -Mensaje "[$($requisito.Grupo)] Posible bloqueo de firewall/VPN/ACL en TCP $($filtrados.Puerto -join ', ')." -Nivel ERROR
+        } else {
+            $estadosTexto = @($estadosGrupo | ForEach-Object { "$($_.Puerto)=$($_.Estado)" }) -join ', '
+            Write-Log -Mensaje "[$($requisito.Grupo)] No hay un puerto disponible ($estadosTexto). Valida servicio, puerto configurado y firewall del servidor." -Nivel ERROR
+        }
+    }
+
+    Write-SeccionMenu -Titulo '3. CARPETAS Y RECURSOS COMPARTIDOS' -Color 'Yellow'
+    $smbDisponible = @($resultadosPuertos | Where-Object { $_.Puerto -eq 445 -and $_.Estado -eq 'open' }).Count -gt 0
+    $rutasServidor = if ($smbDisponible) { @(Get-RutasServidorTerminalCONTPAQi -HostName $hostObjetivo) } else { @() }
+    $rutasAccesibles = 0
+    $rutasObligatorias = @($rutasServidor | Where-Object Obligatoria)
+    if (-not $smbDisponible) {
+        Write-Log -Mensaje 'SMB TCP 445 no esta disponible; se omiten esperas adicionales sobre rutas UNC hasta corregir conectividad/firewall.' -Nivel WARN
+    } else {
+        foreach ($ruta in $rutasServidor) {
+            $pruebaRuta = Test-AccesoRutaServidorCONTPAQi -Ruta $ruta.Ruta
+            if ($pruebaRuta.Lectura) {
+                $rutasAccesibles++
+                Write-Log -Mensaje "Lectura correcta: $($ruta.Ruta) | $($ruta.Origen)." -Nivel OK
+            } elseif ($ruta.Obligatoria) {
+                $incidencias++
+                Write-Log -Mensaje "Sin acceso de lectura: $($ruta.Ruta) | $($pruebaRuta.Error)" -Nivel ERROR
+            } else {
+                Write-Log -Mensaje "Recurso opcional no disponible: $($ruta.Ruta)." -Nivel INFO
+            }
+        }
+    }
+    if ($smbDisponible -and $rutasObligatorias.Count -eq 0 -and $rutasAccesibles -eq 0) {
+        $advertencias++
+        Write-Log -Mensaje 'No se encontro una ruta compartida configurada o accesible. Confirma con el servidor cuál recurso usa esta terminal.' -Nivel WARN
+    }
+    Write-Log -Mensaje 'La prueba valida existencia y lectura. Por seguridad no crea archivos para probar escritura.' -Nivel INFO
+
+    Write-SeccionMenu -Titulo '4. SERVICIOS LOCALES DE LA TERMINAL' -Color 'Green'
+    $serviciosTerminal = @(Get-ServiciosTerminal)
+    if ($serviciosTerminal.Count -eq 0) {
+        $advertencias++
+        Write-Log -Mensaje 'No se detectaron AuthServer/licencias locales; algunos productos pueden no requerirlos en esta estación.' -Nivel WARN
+    } else {
+        foreach ($item in $serviciosTerminal) {
+            $servicio = Get-Service -Name $item.Servicio.Name -ErrorAction SilentlyContinue
+            if ($servicio -and $servicio.Status -eq 'Running') {
+                Write-Log -Mensaje "$($item.Etiqueta): activo." -Nivel OK
+            } else {
+                $incidencias++
+                Write-Log -Mensaje "$($item.Etiqueta): detenido o no disponible." -Nivel ERROR
+            }
+        }
+    }
+
+    $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
+    $estadoFinal = if ($incidencias -eq 0 -and $advertencias -eq 0) { 'TERMINAL LISTA' } elseif ($incidencias -eq 0) { 'TERMINAL CON OBSERVACIONES' } else { 'TERMINAL NO LISTA' }
+    $nivelFinal = if ($incidencias -gt 0) { 'ERROR' } elseif ($advertencias -gt 0) { 'WARN' } else { 'OK' }
+    Write-Separador -Color $(if ($incidencias -gt 0) { $Script:ColorError } elseif ($advertencias -gt 0) { $Script:ColorAdvertencia } else { $Script:ColorExito })
+    Write-Log -Mensaje "$estadoFinal | $incidencias incidencia(s) | $advertencias observacion(es) | $duracion s | Servidor $hostObjetivo" -Nivel $nivelFinal
+    if ($incidencias -gt 0) { Write-Log -Mensaje 'Corrige los puntos en rojo y vuelve a ejecutar esta validacion antes de abrir CONTPAQi.' -Nivel INFO }
 }
 
 function Show-AnalisisProfundoServidorCONTPAQi {
@@ -5782,45 +7102,71 @@ function Show-AnalisisProfundoServidorCONTPAQi {
     Write-SeccionMenu -Titulo "1. IDENTIDAD Y CONECTIVIDAD - $hostObjetivo" -Color 'Cyan'
     $direcciones = @(Resolve-HostCONTPAQi -HostName $hostObjetivo)
     if ($direcciones.Count -eq 0) {
-        Write-Log -Mensaje "No fue posible resolver $hostObjetivo por DNS." -Nivel ERROR
-        return
+        Write-Log -Mensaje "DNS no pudo resolver $hostObjetivo; se continuara usando el nombre/IP capturado para no perder el resto del diagnostico." -Nivel WARN
+    } else {
+        $ipv4 = @($direcciones | Where-Object { $_ -match '^\d{1,3}(?:\.\d{1,3}){3}$' })
+        Write-Log -Mensaje "Servidor: $hostObjetivo | IP: $(if ($ipv4.Count) { $ipv4 -join ', ' } else { $direcciones[0] })" -Nivel OK
     }
-    $ipv4 = @($direcciones | Where-Object { $_ -match '^\d{1,3}(?:\.\d{1,3}){3}$' })
-    Write-Log -Mensaje "Servidor: $hostObjetivo | IP: $(if ($ipv4.Count) { $ipv4 -join ', ' } else { $direcciones[0] })" -Nivel OK
 
-    $catalogoPuertos = @(
-        @{ Puerto = 135;  Uso = 'Administracion remota RPC' },
-        @{ Puerto = 445;  Uso = 'SMB / inventario administrativo' },
-        @{ Puerto = 3389; Uso = 'Escritorio remoto' },
-        @{ Puerto = 1099; Uso = 'Servidor de aplicaciones legado' },
-        @{ Puerto = 1138; Uso = 'Servidor de aplicaciones alterno' },
-        @{ Puerto = 1139; Uso = 'Servidor de aplicaciones alterno' },
-        @{ Puerto = 1775; Uso = 'Servidor de aplicaciones alterno' },
-        @{ Puerto = 2003; Uso = 'Servidor de aplicaciones alterno' },
-        @{ Puerto = 9005; Uso = 'Licenciamiento Nominas' },
-        @{ Puerto = 9020; Uso = 'Licenciamiento Comercial / Factura' },
-        @{ Puerto = 9042; Uso = 'XML en Linea' },
-        @{ Puerto = 9047; Uso = 'Licenciamiento Contabilidad / Bancos' },
-        @{ Puerto = 9079; Uso = 'SACI SSL' },
-        @{ Puerto = 9080; Uso = 'SACI' },
-        @{ Puerto = 9081; Uso = 'Administrador de Documentos Digitales' },
-        @{ Puerto = 9082; Uso = 'Administrador de Documentos Digitales SSL' },
-        @{ Puerto = 9083; Uso = 'SSCI' },
-        @{ Puerto = 9084; Uso = 'SSCI SSL' },
-        @{ Puerto = 9120; Uso = 'AuthServer Comercial / Factura' },
-        @{ Puerto = 9147; Uso = 'AuthServer Contabilidad / Bancos' },
-        @{ Puerto = 1433; Uso = 'SQL Server TCP estatico' }
-    )
+    $catalogoPuertos = @(Get-CatalogoPuertosTerminalCONTPAQi)
     $puertosAbiertos = @()
-    foreach ($item in $catalogoPuertos) {
-        $prueba = Test-PuertoTCP -HostName $hostObjetivo -Port $item.Puerto -TimeoutMs 350
-        if ($prueba.Abierto) {
-            $puertosAbiertos += $item.Puerto
-            Write-Log -Mensaje "TCP $($item.Puerto) abierto | $($item.Uso) | $($prueba.Milisegundos) ms" -Nivel OK
-        }
-        Refresh-Log
+    $motorNmap = Get-NmapExecutableCONTPAQi
+    $escaneoNmap = $null
+    if ($motorNmap.Disponible) {
+        Write-Log -Mensaje "Motor avanzado disponible: Nmap $($motorNmap.Version). Analizando estados, razones y servicios..." -Nivel PROGRESS
+        $escaneoNmap = Invoke-EscaneoPuertosNmapCONTPAQi -HostName $hostObjetivo `
+            -Puertos @($catalogoPuertos | Select-Object -ExpandProperty Puerto) -TimeoutSegundos 90
     }
-    Write-Log -Mensaje "Puertos confirmados: $($puertosAbiertos.Count) de $($catalogoPuertos.Count)." -Nivel $(if ($puertosAbiertos.Count) { 'OK' } else { 'WARN' })
+    if ($escaneoNmap -and $escaneoNmap.Correcto) {
+        $estadosNmap = @($escaneoNmap.Puertos)
+        foreach ($item in $catalogoPuertos) {
+            $resultadoPuerto = $estadosNmap | Where-Object Puerto -eq $item.Puerto | Select-Object -First 1
+            if (-not $resultadoPuerto) {
+                Write-Log -Mensaje "TCP $($item.Puerto) sin clasificacion | $($item.Uso)" -Nivel INFO
+                continue
+            }
+            $identidadServicio = @($resultadoPuerto.Servicio, $resultadoPuerto.Producto, $resultadoPuerto.Version, $resultadoPuerto.Extra) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+            $detalleServicio = if ($identidadServicio.Count) { " | Detectado: $($identidadServicio -join ' ')" } else { '' }
+            $detalle = "TCP $($item.Puerto) $($resultadoPuerto.Estado.ToUpper()) | $($item.Uso) | Razon: $($resultadoPuerto.Razon)$detalleServicio"
+            switch -Regex ($resultadoPuerto.Estado) {
+                '^open$' {
+                    $puertosAbiertos += $item.Puerto
+                    Write-Log -Mensaje $detalle -Nivel OK
+                }
+                '^closed$' { Write-Log -Mensaje $detalle -Nivel INFO }
+                'filtered' { Write-Log -Mensaje $detalle -Nivel WARN }
+                '^unfiltered$' { Write-Log -Mensaje $detalle -Nivel WARN }
+                default { Write-Log -Mensaje $detalle -Nivel INFO }
+            }
+        }
+        $puertosFiltrados = @($estadosNmap | Where-Object { $_.Estado -match 'filtered' } | Select-Object -ExpandProperty Puerto -Unique)
+        $puertosCerrados = @($estadosNmap | Where-Object Estado -eq 'closed' | Select-Object -ExpandProperty Puerto -Unique)
+        Write-Log -Mensaje "Nmap finalizado en $($escaneoNmap.DuracionSegundos) s: $($puertosAbiertos.Count) abierto(s), $($puertosCerrados.Count) cerrado(s), $($puertosFiltrados.Count) filtrado(s)." -Nivel $(if ($puertosFiltrados.Count) { 'WARN' } else { 'OK' })
+        if ($puertosFiltrados.Count) {
+            Write-Log -Mensaje "Posible bloqueo de firewall/ACL en: $($puertosFiltrados -join ', '). 'Filtrado' describe lo observado desde este equipo; revisa firewall local, perimetral, VPN y reglas de red." -Nivel WARN
+        }
+        if ($puertosCerrados.Count) {
+            Write-Log -Mensaje "Puertos cerrados: $($puertosCerrados -join ', '). El servidor es alcanzable, pero no existe un servicio escuchando en esos puertos." -Nivel INFO
+        }
+    } else {
+        $motivoFallback = if ($escaneoNmap) { $escaneoNmap.Error } else { $motorNmap.Error }
+        Write-Log -Mensaje "Nmap no disponible para este analisis: $motivoFallback" -Nivel INFO
+        Write-Log -Mensaje 'Usando comprobacion TCP integrada. Este metodo confirma aperturas, pero no siempre diferencia cerrado de filtrado.' -Nivel INFO
+        foreach ($item in $catalogoPuertos) {
+            $prueba = Test-PuertoTCP -HostName $hostObjetivo -Port $item.Puerto -TimeoutMs 350
+            if ($prueba.Abierto) {
+                $puertosAbiertos += $item.Puerto
+                Write-Log -Mensaje "TCP $($item.Puerto) abierto | $($item.Uso) | $($prueba.Milisegundos) ms" -Nivel OK
+            }
+            Refresh-Log
+        }
+        Write-Log -Mensaje "Puertos confirmados: $($puertosAbiertos.Count) de $($catalogoPuertos.Count)." -Nivel $(if ($puertosAbiertos.Count) { 'OK' } else { 'WARN' })
+        $sinRespuesta = @($catalogoPuertos | Where-Object { $_.Puerto -notin $puertosAbiertos } | Select-Object -ExpandProperty Puerto)
+        if ($sinRespuesta.Count -gt 0) {
+            Write-Log -Mensaje "Sin respuesta TCP: $($sinRespuesta -join ', '). Esto no confirma una falla si el producto correspondiente no esta instalado." -Nivel INFO
+        }
+    }
 
     Write-SeccionMenu -Titulo '2. SISTEMAS, SERVICIOS E INSTANCIAS' -Color 'Magenta'
     $inventario = Get-InventarioServidorCONTPAQi -HostName $hostObjetivo
@@ -5829,11 +7175,18 @@ function Show-AnalisisProfundoServidorCONTPAQi {
     Write-SeccionMenu -Titulo '3. INFRAESTRUCTURA DEL SERVIDOR' -Color 'Yellow'
     $infraestructura = Get-InfraestructuraServidorCONTPAQi -HostName $hostObjetivo
     if ($infraestructura.Acceso) {
-        $horasActivo = [math]::Round(((Get-Date) - [datetime]$infraestructura.UltimoArranque).TotalHours, 1)
-        Write-Log -Mensaje "Equipo: $($infraestructura.Nombre) | Dominio: $($infraestructura.Dominio)" -Nivel OK
-        Write-Log -Mensaje "Hardware: $($infraestructura.Fabricante) $($infraestructura.Modelo) | RAM: $($infraestructura.RAMGB) GB" -Nivel INFO
-        Write-Log -Mensaje "Windows: $($infraestructura.SistemaOperativo) | $($infraestructura.VersionSO) | Build $($infraestructura.BuildSO)" -Nivel INFO
-        Write-Log -Mensaje "Ultimo arranque: $([datetime]$infraestructura.UltimoArranque) | Activo: $horasActivo horas" -Nivel INFO
+        Write-Log -Mensaje "Canal de inventario: $($infraestructura.Protocolo)$(if ($infraestructura.AccesoParcial) { ' | informacion parcial' } else { '' })." -Nivel $(if ($infraestructura.AccesoParcial) { 'WARN' } else { 'OK' })
+        Write-Log -Mensaje "Equipo: $($infraestructura.Nombre)$(if ($infraestructura.Dominio) { " | Dominio: $($infraestructura.Dominio)" } else { '' })" -Nivel OK
+        if ($infraestructura.Fabricante -or $infraestructura.Modelo -or $infraestructura.RAMGB) {
+            Write-Log -Mensaje "Hardware: $($infraestructura.Fabricante) $($infraestructura.Modelo) | RAM: $($infraestructura.RAMGB) GB" -Nivel INFO
+        }
+        if ($infraestructura.SistemaOperativo) {
+            Write-Log -Mensaje "Windows: $($infraestructura.SistemaOperativo) | $($infraestructura.VersionSO) | Build $($infraestructura.BuildSO)" -Nivel INFO
+        }
+        if ($infraestructura.UltimoArranque) {
+            $horasActivo = [math]::Round(((Get-Date) - [datetime]$infraestructura.UltimoArranque).TotalHours, 1)
+            Write-Log -Mensaje "Ultimo arranque: $([datetime]$infraestructura.UltimoArranque) | Activo: $horasActivo horas" -Nivel INFO
+        }
         foreach ($cpu in $infraestructura.Procesadores) {
             Write-Log -Mensaje "CPU: $($cpu.Name.Trim()) | $($cpu.NumberOfCores) nucleos / $($cpu.NumberOfLogicalProcessors) logicos" -Nivel INFO
         }
@@ -5849,6 +7202,9 @@ function Show-AnalisisProfundoServidorCONTPAQi {
         }
         foreach ($recurso in $infraestructura.Recursos) {
             Write-Log -Mensaje "Recurso compartido: \\$hostObjetivo\$($recurso.Name) | $($recurso.Path)" -Nivel INFO
+        }
+        foreach ($errorInfra in @($infraestructura.Errores)) {
+            if ($errorInfra) { Write-Log -Mensaje "Dato de infraestructura no disponible: $errorInfra" -Nivel WARN }
         }
     } else {
         Write-Log -Mensaje "No se pudo obtener hardware, discos y red por CIM/DCOM: $($infraestructura.Error)" -Nivel WARN
@@ -5899,488 +7255,284 @@ function Show-AnalisisProfundoServidorCONTPAQi {
 
     $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
     Write-Separador -Color 'Green'
-    Write-Log -Mensaje "ANALISIS DEL SERVIDOR COMPLETADO en $duracion segundos | $hostObjetivo | $($puertosAbiertos.Count) puerto(s) confirmado(s)." -Nivel OK
+    $analisisParcial = ((-not $inventario.Acceso) -or $inventario.AccesoParcial -or (-not $infraestructura.Acceso) -or $infraestructura.AccesoParcial)
+    Write-Log -Mensaje "ANALISIS DEL SERVIDOR COMPLETADO$(if ($analisisParcial) { ' CON INFORMACION PARCIAL' } else { '' }) en $duracion segundos | $hostObjetivo | $($puertosAbiertos.Count) puerto(s) confirmado(s)." -Nivel $(if ($analisisParcial) { 'WARN' } else { 'OK' })
     Write-Log -Mensaje 'El analisis fue de solo lectura; no se modificaron servicios, sesiones ni bases de datos.' -Nivel INFO
 }
 
-function Get-CatalogoConectividadCONTPAQi {
+
+function Get-CatalogoSatCfdi {
     return @(
-        [PSCustomObject]@{ Puerto = 135;  Grupo = 'Administracion'; Uso = 'RPC / administracion remota' },
-        [PSCustomObject]@{ Puerto = 445;  Grupo = 'Administracion'; Uso = 'SMB / recursos e inventario' },
-        [PSCustomObject]@{ Puerto = 1099; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones legado' },
-        [PSCustomObject]@{ Puerto = 1138; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
-        [PSCustomObject]@{ Puerto = 1139; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
-        [PSCustomObject]@{ Puerto = 1775; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
-        [PSCustomObject]@{ Puerto = 2003; Grupo = 'SACI/ADD'; Uso = 'Servidor de aplicaciones alterno' },
-        [PSCustomObject]@{ Puerto = 9005; Grupo = 'Nominas'; Uso = 'Licenciamiento Nominas' },
-        [PSCustomObject]@{ Puerto = 9020; Grupo = 'Comercial/Factura'; Uso = 'Licenciamiento Comercial / Factura' },
-        [PSCustomObject]@{ Puerto = 9042; Grupo = 'XML en Linea'; Uso = 'Servicio XML en Linea' },
-        [PSCustomObject]@{ Puerto = 9047; Grupo = 'Contabilidad/Bancos'; Uso = 'Licenciamiento Contabilidad / Bancos' },
-        [PSCustomObject]@{ Puerto = 9079; Grupo = 'SACI/ADD'; Uso = 'SACI SSL' },
-        [PSCustomObject]@{ Puerto = 9080; Grupo = 'SACI/ADD'; Uso = 'SACI' },
-        [PSCustomObject]@{ Puerto = 9081; Grupo = 'SACI/ADD'; Uso = 'Administrador de Documentos Digitales' },
-        [PSCustomObject]@{ Puerto = 9082; Grupo = 'SACI/ADD'; Uso = 'Administrador de Documentos Digitales SSL' },
-        [PSCustomObject]@{ Puerto = 9083; Grupo = 'SACI/ADD'; Uso = 'SSCI' },
-        [PSCustomObject]@{ Puerto = 9084; Grupo = 'SACI/ADD'; Uso = 'SSCI SSL' },
-        [PSCustomObject]@{ Puerto = 9120; Grupo = 'Comercial/Factura'; Uso = 'AuthServer Comercial / Factura' },
-        [PSCustomObject]@{ Puerto = 9147; Grupo = 'Contabilidad/Bancos'; Uso = 'AuthServer Contabilidad / Bancos' },
-        [PSCustomObject]@{ Puerto = 1433; Grupo = 'SQL'; Uso = 'SQL Server TCP estatico' }
+        [PSCustomObject]@{ Nombre = 'Control Microsoft'; Grupo = 'CONTROL'; Url = 'https://www.microsoft.com/'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Control Google'; Grupo = 'CONTROL'; Url = 'https://www.google.com/generate_204'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Portal SAT'; Grupo = 'SAT_PORTAL'; Url = 'https://www.sat.gob.mx/'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Verificador CFDI SAT'; Grupo = 'SAT_PORTAL'; Url = 'https://verificacfdi.facturaelectronica.sat.gob.mx/'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Portal CFDI SAT'; Grupo = 'SAT_PORTAL'; Url = 'https://portalcfdi.facturaelectronica.sat.gob.mx/'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Autenticacion descarga SAT'; Grupo = 'SAT_DESCARGA'; Url = 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/Autenticacion/Autenticacion.svc?wsdl'; Modo = 'SERVICIO' },
+        [PSCustomObject]@{ Nombre = 'Solicitud descarga SAT'; Grupo = 'SAT_DESCARGA'; Url = 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/SolicitaDescargaService.svc?wsdl'; Modo = 'SERVICIO' },
+        [PSCustomObject]@{ Nombre = 'Verificacion descarga SAT'; Grupo = 'SAT_DESCARGA'; Url = 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/VerificaSolicitudDescargaService.svc?wsdl'; Modo = 'SERVICIO' },
+        [PSCustomObject]@{ Nombre = 'Entrega paquetes SAT'; Grupo = 'SAT_DESCARGA'; Url = 'https://cfdidescargamasiva.clouda.sat.gob.mx/DescargaMasivaService.svc?wsdl'; Modo = 'SERVICIO' },
+        [PSCustomObject]@{ Nombre = 'Portal CONTPAQi'; Grupo = 'CONTPAQI'; Url = 'https://www.contpaqi.com/'; Modo = 'PAGINA' },
+        [PSCustomObject]@{ Nombre = 'Servicios en linea CONTPAQi'; Grupo = 'CONTPAQI'; Url = 'https://osb.contpaqi.com/'; Modo = 'SERVICIO' }
     )
 }
 
-function Get-GruposConectividadEsperadosCONTPAQi {
-    $productos = @(Get-ProgramasInstalados | Select-Object -ExpandProperty DisplayName)
-    $texto = $productos -join ' | '
-    $grupos = @()
-    if ($texto -match '(?i)contabilidad|bancos') { $grupos += 'Contabilidad/Bancos' }
-    if ($texto -match '(?i)comercial|factura|adminpaq') { $grupos += 'Comercial/Factura' }
-    if ($texto -match '(?i)n[oó]minas') { $grupos += 'Nominas' }
-    if ($texto -match '(?i)XML\s*en\s*l[ií]nea') { $grupos += 'XML en Linea' }
-    if ($texto -match '(?i)CONTPAQ|COMPAC|SACI|APPKEY') { $grupos += @('SACI/ADD', 'SQL') }
-    return @($grupos | Select-Object -Unique)
-}
-
-function Get-EstadoRedLocalResponsive {
-    $codigo = @'
-$adaptadores = @()
-try {
-    $adaptadores = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction Stop | ForEach-Object {
-        [PSCustomObject]@{
-            Descripcion = $_.Description
-            DHCP = [bool]$_.DHCPEnabled
-            IPs = @($_.IPAddress)
-            Mascara = @($_.IPSubnet)
-            Gateways = @($_.DefaultIPGateway)
-            DNS = @($_.DNSServerSearchOrder)
-            MAC = $_.MACAddress
-        }
-    })
-} catch { }
-$perfiles = @()
-try {
-    if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
-        $perfiles = @(Get-NetConnectionProfile -ErrorAction Stop | ForEach-Object {
-            [PSCustomObject]@{ Interfaz = $_.InterfaceAlias; Categoria = $_.NetworkCategory; IPv4 = $_.IPv4Connectivity; IPv6 = $_.IPv6Connectivity }
-        })
-    }
-} catch { }
-$firewall = @()
-try {
-    if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
-        $firewall = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {
-            [PSCustomObject]@{ Perfil = $_.Name; Habilitado = [bool]$_.Enabled; Entrada = $_.DefaultInboundAction; Salida = $_.DefaultOutboundAction }
-        })
-    }
-} catch { }
-$rutas = @()
-try {
-    if (Get-Command Get-NetRoute -ErrorAction SilentlyContinue) {
-        $rutas = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-            Sort-Object RouteMetric, InterfaceMetric | ForEach-Object {
-                [PSCustomObject]@{ Interfaz = $_.InterfaceAlias; Gateway = $_.NextHop; Metrica = ([int]$_.RouteMetric + [int]$_.InterfaceMetric) }
-            })
-    }
-} catch { }
-$proxy = ''
-try { $proxy = ((& netsh.exe winhttp show proxy 2>&1) -join ' ' -replace '\s+', ' ').Trim() } catch { }
-[PSCustomObject]@{ Adaptadores = $adaptadores; Perfiles = $perfiles; Firewall = $firewall; Rutas = $rutas; Proxy = $proxy }
-'@
-    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -TimeoutSeconds 45 -Activity 'Revisando configuracion de red local'
-    if (-not $worker.Correcto -or -not $worker.Resultado) {
-        return [PSCustomObject]@{ Correcto = $false; Error = $worker.Error; Adaptadores = @(); Perfiles = @(); Firewall = @(); Rutas = @(); Proxy = '' }
-    }
-    $resultado = $worker.Resultado
-    $resultado | Add-Member -NotePropertyName Correcto -NotePropertyValue $true -Force
-    $resultado | Add-Member -NotePropertyName Error -NotePropertyValue $null -Force
-    return $resultado
-}
-
-function Invoke-PruebasConectividadCONTPAQi {
+function Invoke-PruebasSatCfdiResponsive {
     param(
-        [Parameter(Mandatory)][string]$HostName,
-        [Parameter(Mandatory)][object[]]$Catalogo
+        [Parameter(Mandatory)][object[]]$Catalogo,
+        [ValidateRange(2, 5)][int]$Muestras = 3
     )
-    $catalogoJson = $Catalogo | ConvertTo-Json -Depth 5 -Compress
+    # Fuerza una sola cadena JSON incluso bajo Windows PowerShell 5.1.
+    $catalogoNormalizado = @($Catalogo | Where-Object { $null -ne $_ })
+    $catalogoJson = ConvertTo-Json -InputObject $catalogoNormalizado -Depth 5 -Compress
     $codigo = @'
-param([string]$TargetHost, [string]$PortsJson)
-function Test-TcpPortInternal {
-    param([string]$HostValue, [int]$PortValue, [int]$TimeoutMs = 650)
-    $cliente = New-Object Net.Sockets.TcpClient
-    $reloj = [Diagnostics.Stopwatch]::StartNew()
-    $async = $null
-    try {
-        $async = $cliente.BeginConnect($HostValue, $PortValue, $null, $null)
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
-            return [PSCustomObject]@{ Puerto = $PortValue; Abierto = $false; Milisegundos = $TimeoutMs; Detalle = 'Tiempo agotado' }
+param([string]$CatalogJson, [int]$SampleCount)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$parsedCatalog = ConvertFrom-Json -InputObject $CatalogJson
+$catalog = @($parsedCatalog | ForEach-Object { $_ })
+$results = @()
+foreach ($endpoint in $catalog) {
+    # Normaliza la propiedad antes de convertirla. Esto protege el diagnostico
+    # contra Object[] en Windows PowerShell 5.1 o datos de catalogo mal formados.
+    $urlText = @($endpoint.PSObject.Properties['Url'].Value | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+    $urlText = if ($urlText.Count) { [string]$urlText[0] } else { '' }
+    $endpointUri = $null
+    if (-not [Uri]::TryCreate($urlText, [UriKind]::Absolute, [ref]$endpointUri) -or $endpointUri.Scheme -notin @('http','https')) {
+        $results += [PSCustomObject]@{
+            Nombre = [string]$endpoint.Nombre; Grupo = [string]$endpoint.Grupo; Url = $urlText
+            Host = ''; DNS = $false; IPs = @(); Disponible = $false; Exitos = 0; Muestras = $SampleCount
+            PromedioMs = 0; MaximoMs = 0; EstadosHttp = @()
+            Errores = @('La direccion configurada no es una URL HTTP/HTTPS valida.'); DesfaseSegundos = $null
         }
-        $cliente.EndConnect($async)
-        return [PSCustomObject]@{ Puerto = $PortValue; Abierto = $true; Milisegundos = [math]::Round($reloj.Elapsed.TotalMilliseconds); Detalle = 'Conexion TCP correcta' }
-    } catch {
-        $detalle = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-        return [PSCustomObject]@{ Puerto = $PortValue; Abierto = $false; Milisegundos = [math]::Round($reloj.Elapsed.TotalMilliseconds); Detalle = $detalle }
-    } finally {
-        if ($async -and $async.AsyncWaitHandle) { $async.AsyncWaitHandle.Close() }
-        $cliente.Close()
-        $reloj.Stop()
+        continue
+    }
+    $hostName = $endpointUri.DnsSafeHost
+    $ips = @()
+    try { $ips = @([Net.Dns]::GetHostAddresses($hostName) | ForEach-Object { $_.IPAddressToString } | Select-Object -Unique) } catch { }
+    $samples = @()
+    for ($sample = 1; $sample -le $SampleCount; $sample++) {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $status = 0
+        $errorText = ''
+        $dateOffset = $null
+        try {
+            $request = [Net.HttpWebRequest]::Create($endpointUri)
+            $request.Method = 'GET'
+            $request.Timeout = 8000
+            $request.ReadWriteTimeout = 8000
+            $request.AllowAutoRedirect = $true
+            $request.MaximumAutomaticRedirections = 4
+            $request.UserAgent = 'CONTPAQi-Toolbox-SAT-Diagnostic/1.0'
+            $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+            $response = $request.GetResponse()
+            try {
+                $status = [int]$response.StatusCode
+                $dateHeader = [string]$response.Headers['Date']
+                if ($dateHeader) {
+                    $remoteDate = [datetime]::Parse($dateHeader).ToUniversalTime()
+                    [double]$ageSeconds = 0
+                    $ageHeader = [string]$response.Headers['Age']
+                    if ($ageHeader) { [void][double]::TryParse($ageHeader, [ref]$ageSeconds) }
+                    if ($ageSeconds -gt 0) { $remoteDate = $remoteDate.AddSeconds($ageSeconds) }
+                    $dateOffset = [math]::Round(([datetime]::UtcNow - $remoteDate).TotalSeconds, 1)
+                }
+            } finally { $response.Dispose() }
+        } catch [Net.WebException] {
+            if ($_.Exception.Response) {
+                try { $status = [int]$_.Exception.Response.StatusCode } finally { $_.Exception.Response.Dispose() }
+            } else { $errorText = $_.Exception.Message }
+        } catch { $errorText = $_.Exception.Message }
+        $watch.Stop()
+        $transportOk = ($status -ge 200 -and $status -le 499)
+        $expectedOk = if ([string]$endpoint.Modo -eq 'SERVICIO') { $transportOk } else { ($status -ge 200 -and $status -le 399) }
+        $samples += [PSCustomObject]@{
+            Numero = $sample; EstadoHttp = $status; Milisegundos = [int]$watch.ElapsedMilliseconds
+            Transporte = $transportOk; Correcto = $expectedOk; Error = $errorText; DesfaseSegundos = $dateOffset
+        }
+        Start-Sleep -Milliseconds 120
+    }
+    $success = @($samples | Where-Object Correcto).Count
+    $latencies = @($samples | Where-Object Transporte | Select-Object -ExpandProperty Milisegundos)
+    $offsets = @($samples | Where-Object { $null -ne $_.DesfaseSegundos } | Select-Object -ExpandProperty DesfaseSegundos)
+    $results += [PSCustomObject]@{
+        Nombre = [string]$endpoint.Nombre; Grupo = [string]$endpoint.Grupo; Url = $endpointUri.AbsoluteUri
+        Host = $hostName; DNS = ($ips.Count -gt 0); IPs = $ips; Disponible = ($success -ge [math]::Ceiling($SampleCount / 2))
+        Exitos = $success; Muestras = $SampleCount
+        PromedioMs = if ($latencies.Count) { [math]::Round(($latencies | Measure-Object -Average).Average, 0) } else { 0 }
+        MaximoMs = if ($latencies.Count) { ($latencies | Measure-Object -Maximum).Maximum } else { 0 }
+        EstadosHttp = @($samples | Select-Object -ExpandProperty EstadoHttp -Unique)
+        Errores = @($samples | Where-Object Error | Select-Object -ExpandProperty Error -Unique)
+        DesfaseSegundos = if ($offsets.Count) { [math]::Round(($offsets | Measure-Object -Average).Average, 1) } else { $null }
     }
 }
-$catalogo = $PortsJson | ConvertFrom-Json
-$ips = @()
-$dnsError = $null
-try {
-    $ips = @([Net.Dns]::GetHostAddresses($TargetHost) | ForEach-Object { $_.IPAddressToString } | Select-Object -Unique)
-} catch { $dnsError = $_.Exception.Message }
-$esIp = $false
-$ipTemporal = $null
-$esIp = [Net.IPAddress]::TryParse($TargetHost, [ref]$ipTemporal)
-$destinoResoluble = ($esIp -or $ips.Count -gt 0)
-$nombreInverso = $null
-if ($esIp) { try { $nombreInverso = [Net.Dns]::GetHostEntry($TargetHost).HostName } catch { } }
-$pingEstado = if ($destinoResoluble) { 'No responde' } else { 'NameResolutionFailure' }
-$pingMs = 0
-$pingDetalle = ''
-$ping = $null
-if ($destinoResoluble) {
-    $ping = New-Object Net.NetworkInformation.Ping
-    try {
-        $respuestaPing = $ping.Send($TargetHost, 1500)
-        $pingEstado = $respuestaPing.Status.ToString()
-        $pingMs = $respuestaPing.RoundtripTime
-    } catch { $pingDetalle = $_.Exception.Message } finally { if ($ping) { $ping.Dispose() } }
-}
-$pruebas = @()
-foreach ($item in $catalogo) {
-    $tcp = if ($destinoResoluble) {
-        Test-TcpPortInternal -HostValue $TargetHost -PortValue ([int]$item.Puerto)
-    } else {
-        [PSCustomObject]@{ Puerto = [int]$item.Puerto; Abierto = $false; Milisegundos = 0; Detalle = 'DNS no resolvio el destino' }
-    }
-    $pruebas += [PSCustomObject]@{
-        Puerto = [int]$item.Puerto; Grupo = [string]$item.Grupo; Uso = [string]$item.Uso
-        Abierto = $tcp.Abierto; Milisegundos = $tcp.Milisegundos; Detalle = $tcp.Detalle
-    }
-}
-$sqlBrowser = $false
-$sqlBrowserDetalle = ''
-$puertosSql = @()
-$udp = $null
-if ($destinoResoluble) {
-    $udp = New-Object Net.Sockets.UdpClient
-    try {
-        $udp.Client.ReceiveTimeout = 1800
-        $udp.Connect($TargetHost, 1434)
-        [byte[]]$solicitud = @(2)
-        $null = $udp.Send($solicitud, $solicitud.Length)
-        $remoto = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
-        $respuesta = $udp.Receive([ref]$remoto)
-        $sqlBrowserDetalle = [Text.Encoding]::ASCII.GetString($respuesta)
-        $sqlBrowser = ($respuesta.Length -gt 0)
-        $puertosSql = @([regex]::Matches($sqlBrowserDetalle, '(?i)(?:^|;)tcp;(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Select-Object -Unique)
-    } catch { $sqlBrowserDetalle = $_.Exception.Message } finally { if ($udp) { $udp.Close() } }
-} else { $sqlBrowserDetalle = 'DNS no resolvio el destino' }
-$pruebasSql = @()
-foreach ($puerto in $puertosSql) {
-    if ($puerto -eq 1433) { continue }
-    $tcp = Test-TcpPortInternal -HostValue $TargetHost -PortValue $puerto -TimeoutMs 900
-    $pruebasSql += [PSCustomObject]@{ Puerto = $puerto; Abierto = $tcp.Abierto; Milisegundos = $tcp.Milisegundos; Detalle = $tcp.Detalle }
-}
-[PSCustomObject]@{
-    EsIP = $esIp; IPs = $ips; DnsError = $dnsError; NombreInverso = $nombreInverso
-    PingEstado = $pingEstado; PingMs = $pingMs; PingDetalle = $pingDetalle
-    Puertos = $pruebas; SqlBrowser = $sqlBrowser; SqlBrowserDetalle = $sqlBrowserDetalle
-    PuertosSqlDinamicos = $puertosSql; PruebasSqlDinamicos = $pruebasSql
-}
+[PSCustomObject]@{ Resultados = $results }
 '@
-    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -Arguments @($HostName, $catalogoJson) `
-        -TimeoutSeconds 120 -Activity "Diagnosticando conectividad con $HostName"
+    $worker = Invoke-ResponsiveWorker -ScriptText $codigo -Arguments @($catalogoJson, $Muestras) -TimeoutSeconds 150 -Activity 'Comprobando SAT, CFDI y CONTPAQi'
     if (-not $worker.Correcto -or -not $worker.Resultado) {
-        return [PSCustomObject]@{ Correcto = $false; Error = $worker.Error }
+        return [PSCustomObject]@{ Correcto = $false; Error = $worker.Error; Resultados = @() }
     }
-    $resultado = $worker.Resultado
-    $resultado | Add-Member -NotePropertyName Correcto -NotePropertyValue $true -Force
-    $resultado | Add-Member -NotePropertyName Error -NotePropertyValue $null -Force
-    return $resultado
+    return [PSCustomObject]@{ Correcto = $true; Error = $null; Resultados = @($worker.Resultado.Resultados) }
 }
 
-function Show-DiagnosticoPuertosCONTPAQi {
-    Write-Encabezado -Titulo 'DIAGNOSTICO PROFESIONAL DE CONECTIVIDAD' -Subtitulo 'Equipo local + DNS + ruta + firewall + SQL + puertos CONTPAQi' -Color 'Cyan'
-    $inicio = Get-Date
-    $hostObjetivo = Select-ServidorObjetivoCONTPAQi
-    if ([string]::IsNullOrWhiteSpace($hostObjetivo)) {
-        Write-Log -Mensaje 'Diagnostico cancelado.' -Nivel WARN
-        return
+function Get-ContextoLocalSatCfdi {
+    $w32time = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
+    $proxyWinHttp = ''
+    try { $proxyWinHttp = ((& netsh.exe winhttp show proxy 2>&1) -join ' ' -replace '\s+', ' ').Trim() } catch { }
+    if ($proxyWinHttp.Length -gt 300) { $proxyWinHttp = $proxyWinHttp.Substring(0, 300) + '...' }
+    $proxyUsuario = ''
+    try {
+        $internet = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+        if ([int]$internet.ProxyEnable -eq 1) { $proxyUsuario = [string]$internet.ProxyServer }
+        elseif ($internet.AutoConfigURL) { $proxyUsuario = "PAC: $($internet.AutoConfigURL)" }
+        else { $proxyUsuario = 'Sin proxy explicito' }
+    } catch { $proxyUsuario = 'No consultado' }
+    $serviciosXml = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        "$($_.Name) $($_.DisplayName) $($_.PathName)" -match '(?i)XMLenLineaService|XMLService|XML\s*en\s*l[ií]nea'
+    } | ForEach-Object {
+        [PSCustomObject]@{ Nombre = $_.Name; Descripcion = $_.DisplayName; Estado = $_.State; Inicio = $_.StartMode; Ruta = $_.PathName }
+    })
+    $productoXml = @(Get-ProgramasInstalados | Where-Object { $_.DisplayName -match '(?i)XML\s*en\s*l[ií]nea' } | Sort-Object DisplayVersion -Descending | Select-Object -First 1)
+    return [PSCustomObject]@{
+        HoraServicio = if ($w32time) { [string]$w32time.Status } else { 'No instalado' }
+        ZonaHoraria = [TimeZoneInfo]::Local.DisplayName
+        HoraLocal = Get-Date
+        ProxyWinHttp = $proxyWinHttp
+        ProxyUsuario = $proxyUsuario
+        ServiciosXml = $serviciosXml
+        ProductoXml = @($productoXml | ForEach-Object { "$($_.DisplayName) $($_.DisplayVersion)".Trim() })
     }
-    $hostObjetivo = ConvertTo-HostServidorCONTPAQi -Valor $hostObjetivo
-    if (-not $hostObjetivo) { Write-Log -Mensaje 'El nombre o IP indicado no es valido.' -Nivel ERROR; return }
+}
 
-    $catalogo = @(Get-CatalogoConectividadCONTPAQi)
-    $gruposEsperados = @(Get-GruposConectividadEsperadosCONTPAQi)
-    $redLocal = Get-EstadoRedLocalResponsive
-    $pruebas = Invoke-PruebasConectividadCONTPAQi -HostName $hostObjetivo -Catalogo $catalogo
-    if (-not $pruebas.Correcto) {
-        Write-Log -Mensaje "No fue posible completar las pruebas: $($pruebas.Error)" -Nivel ERROR
-        return
-    }
-
-    $criticos = 0
-    $advertencias = 0
-    Write-SeccionMenu -Titulo '1. RED DEL EQUIPO ACTUAL' -Color 'Cyan'
-    if (-not $redLocal.Correcto -or @($redLocal.Adaptadores).Count -eq 0) {
-        $criticos++
-        Write-Log -Mensaje 'No se encontro un adaptador IP activo o Windows no permitio consultarlo.' -Nivel ERROR
-    } else {
-        foreach ($adaptador in @($redLocal.Adaptadores)) {
-            $ipv4 = @($adaptador.IPs | Where-Object { $_ -match '^\d{1,3}(?:\.\d{1,3}){3}$' })
-            $gateway = @($adaptador.Gateways | Where-Object { $_ })
-            $dns = @($adaptador.DNS | Where-Object { $_ })
-            Write-Log -Mensaje "$($adaptador.Descripcion) | IPv4: $(if ($ipv4.Count) { $ipv4 -join ', ' } else { 'sin IPv4' }) | DHCP: $(if ($adaptador.DHCP) { 'Si' } else { 'No' })" -Nivel $(if ($ipv4.Count) { 'OK' } else { 'WARN' })
-            Write-Log -Mensaje "Gateway: $(if ($gateway.Count) { $gateway -join ', ' } else { 'no configurado' }) | DNS: $(if ($dns.Count) { $dns -join ', ' } else { 'no configurado' })" -Nivel $(if ($dns.Count) { 'INFO' } else { 'WARN' })
-            if (-not $dns.Count) { $advertencias++ }
-        }
-    }
-    foreach ($perfil in @($redLocal.Perfiles)) {
-        Write-Log -Mensaje "Perfil: $($perfil.Interfaz) | $($perfil.Categoria) | IPv4 $($perfil.IPv4)" -Nivel $(if ($perfil.IPv4 -match 'Internet|LocalNetwork') { 'OK' } else { 'INFO' })
-    }
-    foreach ($ruta in @($redLocal.Rutas | Select-Object -First 3)) {
-        Write-Log -Mensaje "Ruta predeterminada: $($ruta.Interfaz) -> $($ruta.Gateway) | metrica $($ruta.Metrica)" -Nivel INFO
-    }
-    foreach ($perfilFirewall in @($redLocal.Firewall)) {
-        Write-Log -Mensaje "Firewall $($perfilFirewall.Perfil): $(if ($perfilFirewall.Habilitado) { 'Activo' } else { 'Desactivado' }) | Entrada $($perfilFirewall.Entrada) | Salida $($perfilFirewall.Salida)" -Nivel INFO
-    }
-
-    Write-SeccionMenu -Titulo "2. IDENTIDAD DEL SERVIDOR - $hostObjetivo" -Color 'Magenta'
-    $ips = @($pruebas.IPs)
-    if (-not $pruebas.EsIP -and $ips.Count -eq 0) {
-        $criticos++
-        Write-Log -Mensaje "DNS no pudo resolver '$hostObjetivo'." -Nivel ERROR
-        Write-Log -Mensaje 'Causa probable: nombre incorrecto, DNS local, VPN desconectada o registro DNS ausente.' -Nivel INFO
-    } elseif ($pruebas.EsIP) {
-        Write-Log -Mensaje "Objetivo por IP directa: $hostObjetivo$(if ($pruebas.NombreInverso) { " | Nombre inverso: $($pruebas.NombreInverso)" } else { '' })" -Nivel OK
-    } else {
-        Write-Log -Mensaje "Resolucion DNS correcta: $hostObjetivo -> $($ips -join ', ')" -Nivel OK
-        if ($ips.Count -gt 1) { $advertencias++; Write-Log -Mensaje 'El nombre devuelve varias IP. Si la falla es intermitente, valida que todas pertenezcan al servidor correcto.' -Nivel WARN }
-    }
-    $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    $entradaHosts = @()
-    if (-not $pruebas.EsIP -and (Test-Path -LiteralPath $hostsPath)) {
-        $nombreRegex = [regex]::Escape($hostObjetivo)
-        $entradaHosts = @(Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue | Where-Object { $_ -match "(?i)^\s*[^#].*\s$nombreRegex(?:\s|$)" })
-    }
-    if ($entradaHosts.Count) { $advertencias++; Write-Log -Mensaje "El archivo HOSTS contiene una entrada para $hostObjetivo; valida que no apunte a una IP antigua." -Nivel WARN }
-    if ($pruebas.PingEstado -eq 'Success') {
-        Write-Log -Mensaje "ICMP responde en $($pruebas.PingMs) ms." -Nivel OK
-    } else {
-        Write-Log -Mensaje 'El servidor no responde a ping. Esto no confirma una falla: ICMP puede estar bloqueado.' -Nivel INFO
-    }
-
-    Write-SeccionMenu -Titulo '3. SQL SERVER Y DESCUBRIMIENTO DE INSTANCIAS' -Color 'Green'
-    if ($pruebas.SqlBrowser) {
-        Write-Log -Mensaje "SQL Browser UDP 1434 respondio. Puertos anunciados: $(if (@($pruebas.PuertosSqlDinamicos).Count) { @($pruebas.PuertosSqlDinamicos) -join ', ' } else { 'sin puerto TCP publicado' })." -Nivel OK
-        foreach ($sqlTcp in @($pruebas.PruebasSqlDinamicos)) {
-            Write-Log -Mensaje "SQL dinamico TCP $($sqlTcp.Puerto): $(if ($sqlTcp.Abierto) { "abierto ($($sqlTcp.Milisegundos) ms)" } else { 'sin respuesta' })" -Nivel $(if ($sqlTcp.Abierto) { 'OK' } else { 'WARN' })
-        }
-    } else {
-        Write-Log -Mensaje 'SQL Browser UDP 1434 no respondio. Puede estar detenido, bloqueado o no ser necesario para una instancia con puerto fijo.' -Nivel INFO
-    }
-
-    Write-SeccionMenu -Titulo '4. PUERTOS Y SERVICIOS CONTPAQi' -Color 'Yellow'
-    $abiertos = @($pruebas.Puertos | Where-Object Abierto)
-    foreach ($grupo in @($pruebas.Puertos | Group-Object Grupo)) {
-        $grupoEsperado = ($grupo.Name -in $gruposEsperados)
-        $abiertosGrupo = @($grupo.Group | Where-Object Abierto)
-        Write-Log -Mensaje "$($grupo.Name): $($abiertosGrupo.Count) de $($grupo.Count) puerto(s) con respuesta$(if ($grupoEsperado) { ' | producto relacionado detectado' } else { '' })." -Nivel $(if ($abiertosGrupo.Count) { 'OK' } elseif ($grupoEsperado) { 'WARN' } else { 'INFO' })
-        if ($grupoEsperado -and $abiertosGrupo.Count -eq 0) { $advertencias++ }
-        foreach ($puerto in $grupo.Group) {
-            $nivel = if ($puerto.Abierto) { 'OK' } elseif ($grupoEsperado) { 'WARN' } else { 'INFO' }
-            Write-Log -Mensaje "TCP $($puerto.Puerto) $(if ($puerto.Abierto) { "ABIERTO $($puerto.Milisegundos) ms" } else { 'sin respuesta' }) | $($puerto.Uso)" -Nivel $nivel
-        }
-    }
-
-    Write-SeccionMenu -Titulo '5. DIAGNOSTICO Y SIGUIENTE PASO' -Color 'Cyan'
-    $hayPuertoAplicacion = @($abiertos | Where-Object Grupo -notin @('Administracion', 'SQL')).Count -gt 0
-    $haySql = (@($abiertos | Where-Object Grupo -eq 'SQL').Count -gt 0) -or (@($pruebas.PruebasSqlDinamicos | Where-Object Abierto).Count -gt 0)
-    if ($criticos -gt 0) {
-        Write-Log -Mensaje 'CAUSA PROBABLE: configuracion local o resolucion DNS. Corrige esta capa antes de reiniciar servicios.' -Nivel ERROR
-    } elseif (-not $hayPuertoAplicacion -and -not $haySql) {
-        $advertencias++
-        Write-Log -Mensaje 'CAUSA PROBABLE: servidor equivocado, VPN/ruta ausente, firewall intermedio o servicios remotos detenidos.' -Nivel WARN
-    } elseif (-not $hayPuertoAplicacion -and $haySql) {
-        $advertencias++
-        Write-Log -Mensaje 'CAUSA PROBABLE: SQL es accesible, pero los servicios de aplicaciones/licenciamiento CONTPAQi no responden.' -Nivel WARN
-    } elseif ($hayPuertoAplicacion -and -not $haySql) {
-        $advertencias++
-        Write-Log -Mensaje 'CAUSA PROBABLE: el servidor CONTPAQi responde, pero SQL usa otro puerto, SQL Browser esta bloqueado o el motor esta detenido.' -Nivel WARN
-    } elseif ($pruebas.PingEstado -ne 'Success') {
-        Write-Log -Mensaje 'La conectividad TCP funciona aunque ping no responda; ICMP esta probablemente bloqueado y no es la causa.' -Nivel OK
-    } else {
-        Write-Log -Mensaje 'Conectividad base correcta. Si la aplicacion falla, el siguiente paso es revisar salud SQL, servicios y credenciales.' -Nivel OK
-    }
-    if (@($redLocal.Firewall | Where-Object { $_.Habilitado -and $_.Salida -match 'Block' }).Count) {
-        $advertencias++
-        Write-Log -Mensaje 'El firewall local tiene salida bloqueada por defecto; valida reglas de salida para los puertos reportados.' -Nivel WARN
-    }
-    $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
-    Write-Separador -Color $(if ($criticos) { $Script:ColorError } elseif ($advertencias) { $Script:ColorAdvertencia } else { $Script:ColorExito })
-    Write-Log -Mensaje "DIAGNOSTICO FINAL: $criticos problema(s) critico(s), $advertencias advertencia(s), $($abiertos.Count) puerto(s) TCP abierto(s) | $duracion s." -Nivel $(if ($criticos) { 'ERROR' } elseif ($advertencias) { 'WARN' } else { 'OK' })
-    Write-Log -Mensaje 'Analisis de solo lectura: no se modificaron DNS, firewall, adaptadores, servicios ni configuraciones.' -Nivel INFO
+function Save-HistorialSatCfdi {
+    param([Parameter(Mandatory)][object]$Resumen)
+    $directorio = Join-Path $env:ProgramData 'CONTPAQiToolbox\SatCfdi'
+    $archivo = Join-Path $directorio 'historial_sat_cfdi.jsonl'
+    try {
+        if (-not (Test-Path -LiteralPath $directorio -PathType Container)) { New-Item -ItemType Directory -Path $directorio -Force -ErrorAction Stop | Out-Null }
+        $linea = $Resumen | ConvertTo-Json -Depth 7 -Compress
+        Add-Content -LiteralPath $archivo -Value $linea -Encoding UTF8 -ErrorAction Stop
+        $lineas = @(Get-Content -LiteralPath $archivo -ErrorAction Stop)
+        if ($lineas.Count -gt 200) { $lineas | Select-Object -Last 200 | Set-Content -LiteralPath $archivo -Encoding UTF8 -ErrorAction Stop }
+        return [PSCustomObject]@{ Correcto = $true; Archivo = $archivo; Registros = [math]::Min(200, $lineas.Count) }
+    } catch { return [PSCustomObject]@{ Correcto = $false; Archivo = $archivo; Registros = 0; Error = $_.Exception.Message } }
 }
 
 function Show-DiagnosticoTimbrado {
-    Write-Encabezado -Titulo 'TIMBRADO E INTERNET' -Subtitulo 'DNS, HTTPS, reloj y proxy' -Color 'Magenta'
-    $destinos = @(
-        @{ Host = 'www.contpaqi.com'; Puerto = 443; Uso = 'Portal CONTPAQi' },
-        @{ Host = 'osb.contpaqi.com'; Puerto = 443; Uso = 'Servicios en linea CONTPAQi' },
-        @{ Host = 'www.sat.gob.mx'; Puerto = 443; Uso = 'Portal SAT' }
-    )
-    $correctos = 0
-    foreach ($destino in $destinos) {
-        $ips = @(Resolve-HostCONTPAQi -HostName $destino.Host)
-        if ($ips.Count -eq 0) {
-            Write-Log -Mensaje "$($destino.Host): no resuelve por DNS." -Nivel ERROR
-            continue
-        }
-        $prueba = Test-PuertoTCP -HostName $destino.Host -Port $destino.Puerto -TimeoutMs 2500
-        if ($prueba.Abierto) {
-            $correctos++
-            Write-Log -Mensaje "$($destino.Uso): HTTPS accesible ($($prueba.Milisegundos) ms)." -Nivel OK
-        } else {
-            Write-Log -Mensaje "$($destino.Uso): no fue posible conectar al puerto 443." -Nivel ERROR
+    Write-Encabezado -Titulo 'CENTRO SAT / CFDI' -Subtitulo 'Distingue equipo, CONTPAQi, PAC y servicios oficiales del SAT' -Color 'Magenta'
+    $inicio = Get-Date
+    Write-Log -Mensaje 'Prueba de solo lectura: no se enviaran RFC, XML, CSD, e.firma, contrasenas ni documentos.' -Nivel INFO
+
+    Write-SeccionMenu -Titulo '1. EQUIPO, RELOJ Y CONFIGURACION LOCAL' -Color 'Yellow'
+    $contexto = Get-ContextoLocalSatCfdi
+    Write-Log -Mensaje "Hora local: $($contexto.HoraLocal.ToString('dd/MM/yyyy HH:mm:ss')) | Zona: $($contexto.ZonaHoraria) | W32Time: $($contexto.HoraServicio)" -Nivel $(if ($contexto.HoraServicio -eq 'Running') { 'OK' } else { 'WARN' })
+    Write-Log -Mensaje "Proxy WinHTTP: $($contexto.ProxyWinHttp)" -Nivel INFO
+    Write-Log -Mensaje "Proxy del usuario: $($contexto.ProxyUsuario)" -Nivel INFO
+    if ($contexto.ProductoXml.Count) { Write-Log -Mensaje "Producto XML detectado: $($contexto.ProductoXml -join ', ')" -Nivel OK }
+    else { Write-Log -Mensaje 'CONTPAQi XML en Linea no aparece en el inventario de programas.' -Nivel INFO }
+    if ($contexto.ServiciosXml.Count -eq 0) {
+        Write-Log -Mensaje 'No se detecto XMLenLineaService/XMLService en este equipo.' -Nivel INFO
+    } else {
+        foreach ($servicio in $contexto.ServiciosXml) {
+            Write-Log -Mensaje "$($servicio.Nombre): $($servicio.Estado) | Inicio $($servicio.Inicio)" -Nivel $(if ($servicio.Estado -eq 'Running') { 'OK' } else { 'WARN' })
         }
     }
 
-    Write-SeccionMenu -Titulo 'RELOJ Y PROXY' -Color 'Yellow'
-    $w32time = Get-Service -Name 'W32Time' -ErrorAction SilentlyContinue
-    if ($w32time) {
-        $nivelTiempo = if ($w32time.Status -eq 'Running') { 'OK' } else { 'WARN' }
-        Write-Log -Mensaje "Servicio de hora de Windows: $($w32time.Status) | Zona: $([TimeZoneInfo]::Local.DisplayName)" -Nivel $nivelTiempo
-    }
-    $proxy = (& netsh.exe winhttp show proxy 2>&1) -join ' '
-    $proxy = ($proxy -replace '\s+', ' ').Trim()
-    if ($proxy.Length -gt 300) { $proxy = $proxy.Substring(0, 300) + '...' }
-    Write-Log -Mensaje "Proxy WinHTTP: $proxy" -Nivel INFO
-    Write-Log -Mensaje "Conectividad externa: $correctos de $($destinos.Count) destinos disponibles." -Nivel $(if ($correctos -eq $destinos.Count) { 'OK' } else { 'WARN' })
-    Write-Log -Mensaje 'Si la red funciona, valida CSD vigente, contraseña del certificado, manifiesto y estado del documento antes de reintentar el timbrado.' -Nivel INFO
-}
-
-function Get-UtileriasCONTPAQi {
-    $nombres = @('CONTPAQiUsuarios.exe', 'NomTerminalSql.exe')
-    $raices = @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Compac'),
-        (Join-Path $env:ProgramFiles 'Compac'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Compacw'),
-        'C:\Compacw'
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
-    $resultado = @()
-    foreach ($raiz in $raices) {
-        foreach ($nombre in $nombres) {
-            $resultado += Get-ChildItem -LiteralPath $raiz -Filter $nombre -File -Recurse -ErrorAction SilentlyContinue |
-                Select-Object @{Name='Nombre';Expression={$_.BaseName}}, @{Name='Ruta';Expression={$_.FullName}}
-        }
-    }
-    return @($resultado | Sort-Object Ruta -Unique)
-}
-
-function Show-UtileriasCONTPAQi {
-    Write-Encabezado -Titulo 'UTILERIAS OFICIALES DETECTADAS' -Subtitulo 'Herramientas instaladas junto con CONTPAQi' -Color 'Green'
-    $utilerias = @(Get-UtileriasCONTPAQi)
-    if ($utilerias.Count -eq 0) {
-        Write-Log -Mensaje 'No se encontraron CONTPAQiUsuarios ni NomTerminalSql en las rutas instaladas.' -Nivel WARN
+    Write-SeccionMenu -Titulo '2. MUESTREO DE DISPONIBILIDAD - 3 INTENTOS' -Color 'Cyan'
+    $pruebas = Invoke-PruebasSatCfdiResponsive -Catalogo (Get-CatalogoSatCfdi) -Muestras 3
+    if (-not $pruebas.Correcto) {
+        Write-Log -Mensaje "No se completo el muestreo: $($pruebas.Error)" -Nivel ERROR
         return
     }
-    foreach ($utilidad in $utilerias) { Write-Log -Mensaje "$($utilidad.Nombre) | $($utilidad.Ruta)" -Nivel OK }
-    $opciones = @($utilerias | ForEach-Object { "$($_.Nombre)  —  $($_.Ruta)" })
-    $indice = if ($Script:GUIForm -and -not $Script:ConsoleMode) {
-        Show-GUIChoice -Titulo 'Abrir utileria CONTPAQi' -Mensaje 'Selecciona una utileria. Se ejecutara con los permisos actuales:' -Opciones $opciones
-    } else { -1 }
-    if ($indice -ge 0 -and $indice -lt $utilerias.Count) {
-        $seleccion = $utilerias[$indice]
-        if (Confirmar-Accion -Mensaje "Abrir $($seleccion.Nombre)") {
-            try {
-                Start-Process -FilePath $seleccion.Ruta -WorkingDirectory (Split-Path -Parent $seleccion.Ruta) -ErrorAction Stop | Out-Null
-                Write-Log -Mensaje "$($seleccion.Nombre) iniciada correctamente." -Nivel OK
-            } catch {
-                Write-Log -Mensaje "No se pudo iniciar la utileria: $($_.Exception.Message)" -Nivel ERROR
-            }
-        }
-    }
-}
-
-function Show-SaludWindowsSoporte {
-    Write-Encabezado -Titulo 'SALUD DE WINDOWS' -Subtitulo 'Revision segura para servidores y VDI' -Color 'Yellow'
-    $so = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    if ($so) {
-        $uptime = [math]::Round(((Get-Date) - $so.LastBootUpTime).TotalDays, 1)
-        $memoriaLibre = [math]::Round(($so.FreePhysicalMemory * 1KB) / 1GB, 2)
-        $memoriaTotal = [math]::Round(($so.TotalVisibleMemorySize * 1KB) / 1GB, 2)
-        Write-Log -Mensaje "Windows: $($so.Caption) Build $($so.BuildNumber) | Uptime: $uptime dias" -Nivel INFO
-        Write-Log -Mensaje "Memoria disponible: $memoriaLibre GB de $memoriaTotal GB" -Nivel $(if ($memoriaLibre -ge 2) { 'OK' } else { 'WARN' })
-    }
-    if (Test-ReinicioPendiente) {
-        Write-Log -Mensaje 'Existe un reinicio pendiente de Windows.' -Nivel WARN
-    } else {
-        Write-Log -Mensaje 'No se detecta reinicio pendiente.' -Nivel OK
-    }
-    foreach ($nombre in @('Dnscache', 'W32Time', 'LanmanWorkstation')) {
-        $servicio = Get-Service -Name $nombre -ErrorAction SilentlyContinue
-        if ($servicio) {
-            Write-Log -Mensaje "$($servicio.DisplayName): $($servicio.Status)" -Nivel $(if ($servicio.Status -eq 'Running') { 'OK' } else { 'WARN' })
+    foreach ($grupo in @('CONTROL','SAT_PORTAL','SAT_DESCARGA','CONTPAQI')) {
+        $titulo = switch ($grupo) { 'CONTROL' { 'CONTROL DE INTERNET' }; 'SAT_PORTAL' { 'PORTALES OFICIALES SAT' }; 'SAT_DESCARGA' { 'DESCARGA MASIVA SAT' }; default { 'CONTPAQI / PAC' } }
+        Write-SeccionMenu -Titulo $titulo -Color $(if ($grupo -eq 'SAT_DESCARGA') { 'Magenta' } else { 'Green' })
+        foreach ($resultado in @($pruebas.Resultados | Where-Object Grupo -eq $grupo)) {
+            $nivel = if ($resultado.Disponible) { 'OK' } elseif (-not $resultado.DNS) { 'ERROR' } else { 'WARN' }
+            $http = if (@($resultado.EstadosHttp | Where-Object { $_ -gt 0 }).Count) { @($resultado.EstadosHttp | Where-Object { $_ -gt 0 }) -join '/' } else { 'sin respuesta HTTP' }
+            Write-Log -Mensaje "$($resultado.Nombre): $($resultado.Exitos)/$($resultado.Muestras) correcto(s) | HTTP $http | Promedio $($resultado.PromedioMs) ms | Maximo $($resultado.MaximoMs) ms" -Nivel $nivel
+            if (-not $resultado.DNS) { Write-Log -Mensaje "DNS no resolvio $($resultado.Host)." -Nivel ERROR }
+            foreach ($errorRed in @($resultado.Errores | Select-Object -First 2)) { Write-Log -Mensaje "Detalle: $errorRed" -Nivel INFO }
         }
     }
 
-    Write-SeccionMenu -Titulo 'ALMACENAMIENTO' -Color 'Yellow'
-    foreach ($disco in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)) {
-        $libre = [math]::Round($disco.FreeSpace / 1GB, 1)
-        $total = [math]::Round($disco.Size / 1GB, 1)
-        Write-Log -Mensaje "$($disco.DeviceID) $libre GB libres de $total GB" -Nivel $(if ($libre -ge 10) { 'OK' } else { 'WARN' })
+    $control = @($pruebas.Resultados | Where-Object Grupo -eq 'CONTROL')
+    $satPortal = @($pruebas.Resultados | Where-Object Grupo -eq 'SAT_PORTAL')
+    $satDescarga = @($pruebas.Resultados | Where-Object Grupo -eq 'SAT_DESCARGA')
+    $contpaqi = @($pruebas.Resultados | Where-Object Grupo -eq 'CONTPAQI')
+    $controlOk = (@($control | Where-Object Disponible).Count -ge [math]::Ceiling($control.Count / 2))
+    $portalOk = (@($satPortal | Where-Object Disponible).Count -ge [math]::Ceiling($satPortal.Count / 2))
+    $descargaOk = (@($satDescarga | Where-Object Disponible).Count -ge [math]::Ceiling($satDescarga.Count / 2))
+    $servicioContpaqi = @($contpaqi | Where-Object Nombre -eq 'Servicios en linea CONTPAQi' | Select-Object -First 1)[0]
+    $contpaqiOk = if ($servicioContpaqi) { [bool]$servicioContpaqi.Disponible } else { (@($contpaqi | Where-Object Disponible).Count -ge [math]::Ceiling($contpaqi.Count / 2)) }
+    $xmlDetenido = (@($contexto.ServiciosXml | Where-Object Estado -ne 'Running').Count -gt 0)
+    # Solo se usan controles y servicios dinamicos para estimar la hora. Los
+    # portales web pueden entregar HTML almacenado en cache durante horas.
+    $desfases = @($pruebas.Resultados | Where-Object { $_.Grupo -in @('CONTROL','SAT_DESCARGA') -and $null -ne $_.DesfaseSegundos } | Select-Object -ExpandProperty DesfaseSegundos)
+    $desfasePromedio = if ($desfases.Count) { [math]::Round(($desfases | Measure-Object -Average).Average, 1) } else { $null }
+
+    $clasificacion = 'SIN FALLA EXTERNA AL MOMENTO'
+    $confianza = 'MEDIA'
+    $explicacion = 'Internet, SAT y CONTPAQi respondieron durante las muestras. La incidencia pudo ser intermitente o depender del documento, CSD, e.firma, PAC o cola de descarga.'
+    $accion = 'Conserva la hora exacta y el mensaje original. Repite el diagnostico durante la falla y revisa el historial antes de reiniciar servicios.'
+    $nivelFinal = 'OK'
+    if (-not $controlOk) {
+        $clasificacion = 'EQUIPO, DNS, PROXY O RED LOCAL'
+        $confianza = 'ALTA'
+        $explicacion = 'Los controles independientes de Internet tambien fallaron; no existe evidencia suficiente para atribuir la incidencia al SAT.'
+        $accion = 'Revisa DNS, gateway, proxy, firewall, antivirus, VPN y salida HTTPS del equipo antes de tocar CONTPAQi.'
+        $nivelFinal = 'ERROR'
+    } elseif (-not $portalOk -and -not $descargaOk) {
+        $clasificacion = 'PROBABLE INTERMITENCIA GENERAL DEL SAT'
+        $confianza = 'ALTA'
+        $explicacion = 'Internet funciona, pero fallaron repetidamente portales y servicios oficiales independientes del SAT.'
+        $accion = 'No reinstales ni reinicies SQL. Espera, conserva evidencia, repite en 5 a 10 minutos y compara desde otra red.'
+        $nivelFinal = 'ERROR'
+    } elseif ($portalOk -and -not $descargaOk) {
+        $clasificacion = 'PROBABLE INTERMITENCIA EN DESCARGA MASIVA SAT'
+        $confianza = 'ALTA'
+        $explicacion = 'Los portales del SAT responden, pero autenticacion, solicitud, verificacion o entrega de paquetes presentan fallas repetidas.'
+        $accion = 'Conserva la solicitud; no generes peticiones duplicadas. Reintenta despues y revisa si el SAT la mantiene pendiente.'
+        $nivelFinal = 'WARN'
+    } elseif (-not $contpaqiOk) {
+        $clasificacion = 'PROBABLE SERVICIO CONTPAQI / PAC'
+        $confianza = 'MEDIA'
+        $explicacion = 'Internet y SAT responden, pero los destinos de CONTPAQi no tuvieron disponibilidad consistente.'
+        $accion = 'Valida avisos de CONTPAQi/PAC, bitacora de timbrado, folios y el error exacto antes de modificar certificados.'
+        $nivelFinal = 'WARN'
+    } elseif ($xmlDetenido) {
+        $clasificacion = 'SERVICIO LOCAL XML EN LINEA'
+        $confianza = 'ALTA'
+        $explicacion = 'Los servicios externos responden, pero XMLenLineaService/XMLService esta detenido en este equipo.'
+        $accion = 'Revisa su bitacora y ruta ejecutable; despues inicia el servicio de forma controlada y valida una solicitud existente.'
+        $nivelFinal = 'WARN'
+    } elseif ($null -ne $desfasePromedio -and [math]::Abs($desfasePromedio) -gt 300) {
+        $clasificacion = 'RELOJ LOCAL FUERA DE SINCRONIA'
+        $confianza = 'ALTA'
+        $explicacion = "El reloj difiere aproximadamente $([math]::Abs($desfasePromedio)) segundos de las respuestas HTTPS. Esto puede invalidar tokens, CSD y e.firma."
+        $accion = 'Corrige zona horaria y sincronizacion de Windows antes de reintentar autenticacion o timbrado.'
+        $nivelFinal = 'ERROR'
     }
 
-    Write-SeccionMenu -Titulo 'IMAGEN DE WINDOWS' -Color 'Cyan'
-    Write-Log -Mensaje 'Ejecutando DISM CheckHealth (solo diagnostico)...' -Nivel PROGRESS
-    $codigoDismWorker = @'
-$salida = & dism.exe /Online /Cleanup-Image /CheckHealth /English 2>&1
-[PSCustomObject]@{ ExitCode = $LASTEXITCODE; Texto = (($salida -join ' ') -replace '\s+', ' ').Trim() }
-'@
-    $resultadoDismWorker = Invoke-ResponsiveWorker -ScriptText $codigoDismWorker -TimeoutSeconds 900 -Activity 'Revisando imagen de Windows'
-    $codigoDism = if ($resultadoDismWorker.Correcto -and $resultadoDismWorker.Resultado) { $resultadoDismWorker.Resultado.ExitCode } else { -1 }
-    $textoDism = if ($resultadoDismWorker.Resultado) { $resultadoDismWorker.Resultado.Texto } else { $resultadoDismWorker.Error }
-    if ($codigoDism -eq 0 -and $textoDism -match 'No component store corruption detected') {
-        Write-Log -Mensaje 'DISM no reporto corrupcion reparable en la imagen de Windows.' -Nivel OK
-    } elseif ($codigoDism -eq 0 -and $textoDism -match 'component store is repairable') {
-        Write-Log -Mensaje 'DISM detecto que la imagen de Windows es reparable. Programa DISM RestoreHealth.' -Nivel WARN
-    } elseif ($codigoDism -eq 0) {
-        Write-Log -Mensaje 'DISM CheckHealth finalizo correctamente; revisa la salida detallada si el problema continua.' -Nivel INFO
-    } else {
-        Write-Log -Mensaje "DISM finalizo con codigo $codigoDism. Ejecuta RestoreHealth en una ventana de mantenimiento." -Nivel WARN
-        if ($textoDism) { Write-Log -Mensaje $textoDism -Nivel INFO }
+    Write-SeccionMenu -Titulo '3. DIAGNOSTICO CORRELACIONADO' -Color $(if ($nivelFinal -eq 'ERROR') { 'Red' } elseif ($nivelFinal -eq 'WARN') { 'Yellow' } else { 'Green' })
+    Write-Log -Mensaje "CAUSA PROBABLE: $clasificacion | Confianza $confianza" -Nivel $nivelFinal
+    Write-Log -Mensaje $explicacion -Nivel INFO
+    Write-Log -Mensaje "ACCION: $accion" -Nivel INFO
+    if ($null -ne $desfasePromedio) { Write-Log -Mensaje "Desfase aproximado del reloj frente a servidores HTTPS: $desfasePromedio segundos." -Nivel $(if ([math]::Abs($desfasePromedio) -le 300) { 'OK' } else { 'WARN' }) }
+    Write-Log -Mensaje 'Una respuesta HTTPS solo confirma disponibilidad tecnica; no valida credenciales, CSD, e.firma, saldos de timbres ni reglas fiscales del documento.' -Nivel WARN
+
+    $resumenHistorial = [PSCustomObject]@{
+        Fecha = Get-Date; Equipo = $env:COMPUTERNAME; Clasificacion = $clasificacion; Confianza = $confianza
+        ControlDisponible = $controlOk; PortalSatDisponible = $portalOk; DescargaSatDisponible = $descargaOk
+        ContpaqiDisponible = $contpaqiOk; ServicioXmlDetenido = $xmlDetenido
+        Resultados = @($pruebas.Resultados | Select-Object Nombre, Grupo, Disponible, Exitos, Muestras, PromedioMs, MaximoMs, EstadosHttp)
     }
-    Write-Log -Mensaje 'SFC /scannow, DISM /RestoreHealth y Winsock Reset no se ejecutan automaticamente porque pueden tardar o requerir reinicio.' -Nivel INFO
+    $historial = Save-HistorialSatCfdi -Resumen $resumenHistorial
+    if ($historial.Correcto) { Write-Log -Mensaje "Historial guardado: $($historial.Archivo) | $($historial.Registros) registro(s)." -Nivel OK }
+    else { Write-Log -Mensaje "No se pudo guardar historial SAT/CFDI: $($historial.Error)" -Nivel WARN }
+    $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
+    Write-Log -Mensaje "Diagnostico SAT/CFDI finalizado en $duracion segundos con 3 muestras por destino." -Nivel INFO
 }
 
-function Show-CentroSoluciones {
-    Write-Encabezado -Titulo 'CENTRO DE SOLUCIONES' -Subtitulo 'Asistentes basados en casos reales de soporte' -Color 'Cyan'
-    $opciones = @(
-        'Conectividad, servidor y puertos de licenciamiento',
-        'Timbrado, Internet, DNS, reloj y proxy',
-        'Buscar y abrir utilerias oficiales instaladas',
-        'Revisar salud de Windows, VDI y almacenamiento'
-    )
-    $indice = if ($Script:GUIForm -and -not $Script:ConsoleMode) {
-        Show-GUIChoice -Titulo 'Centro de soluciones CONTPAQi' -Mensaje 'Elige el tipo de problema que deseas diagnosticar:' -Opciones $opciones
-    } else {
-        Write-OpcionMenu -Tecla '1' -Descripcion $opciones[0]
-        Write-OpcionMenu -Tecla '2' -Descripcion $opciones[1]
-        Write-OpcionMenu -Tecla '3' -Descripcion $opciones[2]
-        Write-OpcionMenu -Tecla '4' -Descripcion $opciones[3]
-        ([int](Read-Host ' Selecciona una opcion')) - 1
-    }
-    switch ($indice) {
-        0 { Show-DiagnosticoPuertosCONTPAQi }
-        1 { Show-DiagnosticoTimbrado }
-        2 { Show-UtileriasCONTPAQi }
-        3 { Show-SaludWindowsSoporte }
-        default { Write-Log -Mensaje 'Centro de soluciones cerrado sin realizar cambios.' -Nivel INFO }
-    }
-}
 
 function Get-ServiciosCONTPAQiDetectados {
     $encontrados = @{}
@@ -6449,19 +7601,44 @@ function Invoke-ServiceActionResponsive {
         [Parameter(Mandatory)][ValidateSet('Start', 'Stop')][string]$Accion,
         [ValidateRange(5, 300)][int]$TimeoutSegundos = 60
     )
-    $codigoServicio = @'
+$codigoServicio = @'
 param([string]$ServiceName, [string]$Action, [int]$TimeoutSeconds)
 try {
     $servicio = Get-Service -Name $ServiceName -ErrorAction Stop
     $estadoDeseadoTexto = if ($Action -eq 'Start') { 'Running' } else { 'Stopped' }
-    if ($servicio.Status.ToString() -ne $estadoDeseadoTexto) {
-        if ($Action -eq 'Start') {
-            Start-Service -Name $ServiceName -ErrorAction Stop
-        } else {
-            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    $estadoDeseado = [Enum]::Parse([System.ServiceProcess.ServiceControllerStatus], $estadoDeseadoTexto)
+    $espera = [TimeSpan]::FromSeconds($TimeoutSeconds)
+    $servicio.Refresh()
+    if ($Action -eq 'Start') {
+        if ($servicio.Status.ToString() -eq 'StopPending') {
+            $servicio.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, $espera)
+            $servicio.Refresh()
         }
-        $estadoDeseado = [Enum]::Parse([System.ServiceProcess.ServiceControllerStatus], $estadoDeseadoTexto)
-        $servicio.WaitForStatus($estadoDeseado, [TimeSpan]::FromSeconds($TimeoutSeconds))
+        if ($servicio.Status.ToString() -eq 'StartPending') {
+            $servicio.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, $espera)
+        } elseif ($servicio.Status.ToString() -ne 'Running') {
+            try { Start-Service -Name $ServiceName -ErrorAction Stop }
+            catch {
+                $salidaSc = @(& "$env:SystemRoot\System32\sc.exe" start $ServiceName 2>&1)
+                if ($LASTEXITCODE -notin @(0, 1056)) { throw "Start-Service: $($_.Exception.Message) | sc.exe: $($salidaSc -join ' ')" }
+            }
+            $servicio.WaitForStatus($estadoDeseado, $espera)
+        }
+    } else {
+        if ($servicio.Status.ToString() -eq 'StartPending') {
+            $servicio.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Running, $espera)
+            $servicio.Refresh()
+        }
+        if ($servicio.Status.ToString() -eq 'StopPending') {
+            $servicio.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, $espera)
+        } elseif ($servicio.Status.ToString() -ne 'Stopped') {
+            try { Stop-Service -Name $ServiceName -Force -ErrorAction Stop }
+            catch {
+                $salidaSc = @(& "$env:SystemRoot\System32\sc.exe" stop $ServiceName 2>&1)
+                if ($LASTEXITCODE -notin @(0, 1062)) { throw "Stop-Service: $($_.Exception.Message) | sc.exe: $($salidaSc -join ' ')" }
+            }
+            $servicio.WaitForStatus($estadoDeseado, $espera)
+        }
     }
     $servicio.Refresh()
     [PSCustomObject]@{
@@ -6470,7 +7647,13 @@ try {
         Error = $null
     }
 } catch {
-    [PSCustomObject]@{ Correcto = $false; Estado = 'Desconocido'; Error = $_.Exception.Message }
+    $detalle = $_.Exception.Message
+    try {
+        $nombreSeguro = $ServiceName.Replace("'", "''")
+        $cim = Get-CimInstance Win32_Service -Filter "Name='$nombreSeguro'" -ErrorAction Stop
+        $detalle += " | Estado=$($cim.State), Inicio=$($cim.StartMode), Win32Exit=$($cim.ExitCode), ServiceExit=$($cim.ServiceSpecificExitCode)"
+    } catch { }
+    [PSCustomObject]@{ Correcto = $false; Estado = 'Desconocido'; Error = $detalle }
 }
 '@
     $verbo = if ($Accion -eq 'Start') { 'Iniciando' } else { 'Deteniendo' }
@@ -6543,28 +7726,52 @@ function Restore-ServicesDevAfterRepair {
 }
 
 function Start-TodosServiciosCONTPAQiVerificado {
-    param([ValidateRange(1, 3)][int]$Intentos = 2)
+    param(
+        [ValidateRange(1, 3)][int]$Intentos = 2,
+        [switch]$RecuperarDeshabilitados
+    )
 
     $servicios = @(Get-ServiciosAplicacionCONTPAQi | Sort-Object `
         @{ Expression = { Get-OrdenInicioServicioCONTPAQi -Servicio $_ } }, Name)
-    $correctos = 0
     $omitidos = 0
-    $fallidos = New-Object System.Collections.Generic.List[string]
+    $erroresInicio = @{}
 
     foreach ($servicioInicial in $servicios) {
         $nombre = $servicioInicial.Name
         $actual = Get-Service -Name $nombre -ErrorAction SilentlyContinue
         if (-not $actual) { continue }
         if (Test-ServicioDeshabilitado -Nombre $nombre) {
-            $omitidos++
-            Write-Log -Mensaje "$nombre esta deshabilitado en Windows; se conserva su configuracion." -Nivel WARN
-            continue
+            if (-not $RecuperarDeshabilitados) {
+                $omitidos++
+                Write-Log -Mensaje "$nombre esta deshabilitado en Windows; se conserva su configuracion." -Nivel WARN
+                continue
+            }
+            try {
+                Set-Service -Name $nombre -StartupType Manual -ErrorAction Stop
+                Write-Log -Mensaje "$nombre estaba deshabilitado; se restablecio a inicio Manual para permitir su recuperacion." -Nivel WARN
+                $actual = Get-Service -Name $nombre -ErrorAction Stop
+            } catch {
+                $erroresInicio[$nombre] = "No se pudo recuperar el tipo de inicio: $($_.Exception.Message)"
+                Write-Log -Mensaje "$nombre sigue deshabilitado: $($_.Exception.Message)" -Nivel ERROR
+                continue
+            }
         }
         if ($actual.Status -eq 'Running') {
-            $correctos++
             Write-Log -Mensaje "$nombre ya estaba activo." -Nivel OK
             continue
         }
+
+        # Las dependencias se recuperan primero. Esto evita falsos fallos 1068
+        # cuando el servicio CONTPAQi esta bien pero una dependencia se detuvo.
+        try {
+            foreach ($dependencia in @($actual.ServicesDependedOn)) {
+                $depActual = Get-Service -Name $dependencia.ServiceName -ErrorAction SilentlyContinue
+                if (-not $depActual -or $depActual.Status -eq 'Running' -or (Test-ServicioDeshabilitado -Nombre $depActual.Name)) { continue }
+                $resultadoDep = Invoke-ServiceActionResponsive -Nombre $depActual.Name -Accion Start -TimeoutSegundos 60
+                if ($resultadoDep.Correcto) { Write-Log -Mensaje "Dependencia $($depActual.Name) iniciada para $nombre." -Nivel OK }
+                else { Write-Log -Mensaje "Dependencia $($depActual.Name) no pudo iniciarse: $($resultadoDep.Error)" -Nivel WARN }
+            }
+        } catch { Write-Log -Mensaje "No se pudieron enumerar todas las dependencias de $($nombre): $($_.Exception.Message)" -Nivel WARN }
 
         $ultimoError = ''
         $iniciado = $false
@@ -6581,29 +7788,45 @@ function Start-TodosServiciosCONTPAQiVerificado {
             }
         }
         if ($iniciado) {
-            $correctos++
             Write-Log -Mensaje "$nombre iniciado y verificado." -Nivel OK
         } else {
-            $fallidos.Add($nombre)
+            $erroresInicio[$nombre] = $ultimoError
             Write-Log -Mensaje "No se pudo iniciar $($nombre): $ultimoError" -Nivel ERROR
         }
     }
 
-    # Auditoria final independiente: evita declarar exito con un servicio que
-    # se haya detenido nuevamente durante el arranque de sus dependencias.
-    $noActivos = @(Get-ServiciosAplicacionCONTPAQi | Where-Object {
+    # Prueba de estabilidad y segunda oportunidad independiente: no se declara
+    # exito hasta comprobar que el servicio permanece activo despues del lote.
+    Wait-Responsive -Seconds 2
+    $segundaVuelta = @(Get-ServiciosAplicacionCONTPAQi | Where-Object {
         -not (Test-ServicioDeshabilitado -Nombre $_.Name) -and $_.Status -ne 'Running'
     } | Select-Object -ExpandProperty Name -Unique)
-    foreach ($nombre in $noActivos) {
-        if (-not $fallidos.Contains($nombre)) { $fallidos.Add($nombre) }
+    foreach ($nombre in $segundaVuelta) {
+        Write-Log -Mensaje "$nombre no permanecio activo; ejecutando recuperacion final." -Nivel WARN
+        $resultadoFinal = Invoke-ServiceActionResponsive -Nombre $nombre -Accion Start -TimeoutSegundos 90
+        if ($resultadoFinal.Correcto) {
+            $erroresInicio.Remove($nombre)
+            Write-Log -Mensaje "$nombre recuperado y estable en la segunda verificacion." -Nivel OK
+        } else {
+            $erroresInicio[$nombre] = $resultadoFinal.Error
+            Write-Log -Mensaje "Fallo definitivo en $($nombre): $($resultadoFinal.Error)" -Nivel ERROR
+        }
     }
+
+    Wait-Responsive -Seconds 1
+    $finales = @(Get-ServiciosAplicacionCONTPAQi)
+    $fallidos = @($finales | Where-Object {
+        -not (Test-ServicioDeshabilitado -Nombre $_.Name) -and $_.Status -ne 'Running'
+    } | Select-Object -ExpandProperty Name -Unique)
+    $correctos = @($finales | Where-Object { $_.Status -eq 'Running' }).Count
 
     return [PSCustomObject]@{
         Total = $servicios.Count
         Correctos = $correctos
         Omitidos = $omitidos
-        Fallidos = $fallidos.Count
+        Fallidos = @($fallidos).Count
         FallidosNombres = @($fallidos)
+        Errores = $erroresInicio
     }
 }
 
@@ -6639,680 +7862,6 @@ foreach ($path in $Paths) {
 # Esta capa es deliberadamente conservadora: muestra evidencia y solo ofrece
 # reparaciones reversibles. Nunca modifica tablas, colas MSMQ, ACL ni archivos
 # de programa a partir de una coincidencia de texto.
-function Protect-TextoBitacoraCONTPAQi {
-    param(
-        [AllowEmptyString()][string]$Texto,
-        [int]$LongitudMaxima = 900
-    )
-    if ([string]::IsNullOrWhiteSpace($Texto)) { return '' }
-
-    $limpio = $Texto -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ' '
-    $limpio = $limpio -replace '(?i)(authorization\s*[:=])\s*[^;\r\n]+', '$1 ***'
-    $limpio = $limpio -replace '(?i)(password|passwd|pwd|clave|contrasena|contrase.a|token|secret|api[_-]?key)\s*=\s*([^;\r\n]+)', '$1=***'
-    $limpio = $limpio -replace '(?i)(password|passwd|pwd|clave|contrasena|contrase.a|token|secret|api[_-]?key)\s*:\s*([^;\s,]+)', '$1:***'
-    $limpio = $limpio -replace '(?i)(["''](?:password|passwd|pwd|token|secret|api[_-]?key)["'']\s*:\s*["''])[^"'']+', '$1***'
-    $limpio = $limpio -replace '(?i)(User\s*ID|UID)\s*=\s*([^;]+)', '$1=***'
-    $limpio = $limpio -replace '(?i)([?&](?:token|key|secret|password|pwd)=)[^&\s]+', '$1***'
-    $limpio = (($limpio -replace '[\r\n]+', ' ') -replace '\s+', ' ').Trim()
-    if ($limpio.Length -gt $LongitudMaxima) {
-        $limpio = $limpio.Substring(0, $LongitudMaxima) + '...'
-    }
-    return $limpio
-}
-
-function Get-RutasBitacoraCONTPAQi {
-    $candidatas = @(
-        'C:\Compac',
-        'C:\CONTPAQi',
-        (Join-Path ${env:ProgramFiles(x86)} 'Compac'),
-        (Join-Path $env:ProgramFiles 'Compac'),
-        (Join-Path $env:ProgramData 'Compac'),
-        (Join-Path $env:ProgramData 'CONTPAQi'),
-        (Join-Path $env:LOCALAPPDATA 'Compac'),
-        (Join-Path $env:LOCALAPPDATA 'CONTPAQi'),
-        (Join-Path $env:APPDATA 'Compac'),
-        (Join-Path $env:APPDATA 'CONTPAQi')
-    )
-    return @($candidatas | Where-Object {
-        $_ -and (Test-Path -LiteralPath $_ -PathType Container) -and
-        $_ -notlike "$($Script:LogDirectory)*"
-    } | Select-Object -Unique)
-}
-
-function Get-RutasERRORLOGSQLLocal {
-    $rutas = New-Object System.Collections.Generic.List[string]
-    foreach ($baseRegistro in @(
-        'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server'
-    )) {
-        try {
-            $claveInstancias = Join-Path $baseRegistro 'Instance Names\SQL'
-            if (-not (Test-Path -LiteralPath $claveInstancias)) { continue }
-            $instancias = Get-ItemProperty -LiteralPath $claveInstancias -ErrorAction Stop
-            foreach ($propiedad in @($instancias.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
-                $id = [string]$propiedad.Value
-                if ([string]::IsNullOrWhiteSpace($id)) { continue }
-                $claveParametros = Join-Path $baseRegistro "$id\MSSQLServer\Parameters"
-                if (Test-Path -LiteralPath $claveParametros) {
-                    $parametros = Get-ItemProperty -LiteralPath $claveParametros -ErrorAction SilentlyContinue
-                    foreach ($parametro in @($parametros.PSObject.Properties | Where-Object { $_.Name -match '^SQLArg\d+$' })) {
-                        $valor = [Environment]::ExpandEnvironmentVariables(([string]$parametro.Value).Trim())
-                        if ($valor -match '(?i)^-e\s*"?(.+?ERRORLOG)"?$') { $rutas.Add($matches[1].Trim('"')) }
-                    }
-                }
-                $rutas.Add((Join-Path $env:ProgramFiles "Microsoft SQL Server\$id\MSSQL\Log\ERRORLOG"))
-            }
-        } catch { }
-    }
-
-    foreach ($servicio in @(Get-ServiciosMotorSQL)) {
-        try {
-            $imagen = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($servicio.Name)" -Name ImagePath -ErrorAction Stop).ImagePath)
-            if ($imagen -match '(?i)(?:^|\s)-e\s*"([^"]+ERRORLOG)"') { $rutas.Add($matches[1]) }
-            elseif ($imagen -match '(?i)(?:^|\s)-e\s*([^\s]+ERRORLOG)') { $rutas.Add($matches[1].Trim('"')) }
-        } catch { }
-    }
-    return @($rutas | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function Get-ArchivosBitacoraCONTPAQi {
-    param(
-        [ValidateRange(1, 365)][int]$Dias = 30,
-        [ValidateRange(10, 500)][int]$MaxArchivos = 150
-    )
-    $payload = [PSCustomObject]@{
-        Raices = @(Get-RutasBitacoraCONTPAQi)
-        ErrorLogs = @(Get-RutasERRORLOGSQLLocal)
-        Corte = (Get-Date).AddDays(-$Dias).ToString('o')
-        MaxArchivos = $MaxArchivos
-        LogActual = [string]$Script:LogFile
-    } | ConvertTo-Json -Depth 5 -Compress
-    $codigoBusqueda = @'
-param([string]$Json)
-$config = $Json | ConvertFrom-Json
-$corte = [DateTime]::Parse($config.Corte)
-$encontrados = New-Object System.Collections.Generic.List[object]
-foreach ($raiz in @($config.Raices)) {
-    try {
-        foreach ($archivo in @(Get-ChildItem -LiteralPath $raiz -File -Recurse -Force -ErrorAction SilentlyContinue)) {
-            if ($archivo.LastWriteTime -lt $corte -or $archivo.Length -le 0 -or $archivo.Length -gt 20MB) { continue }
-            if ($archivo.Extension -notin @('.log', '.txt', '.err', '.trace', '.json')) { continue }
-            if ($archivo.FullName -match '(?i)\\(Idiomas?|Languages?|Reportes?|Reports?|SAT|ms-playwright|node_modules|packages?|Help|Ayuda|Samples?|Ejemplos?|Cache)\\') { continue }
-            if ($archivo.Name -match '(?i)^(install|installer|inst[-_.]|setup|uninstall)') { continue }
-            if ($archivo.Extension -in @('.txt', '.json') -and
-                $archivo.Name -notmatch '(?i)(log|bitac|error|trace|saci|excep)' -and
-                $archivo.DirectoryName -notmatch '(?i)\\(log|logs|bitacora|bitacoras)($|\\)') { continue }
-            if ($config.LogActual -and $archivo.FullName -eq $config.LogActual) { continue }
-            $encontrados.Add($archivo)
-        }
-    } catch { }
-}
-foreach ($rutaERRORLOG in @($config.ErrorLogs)) {
-    try {
-        $directorio = Split-Path -Path $rutaERRORLOG -Parent
-        if (-not (Test-Path -LiteralPath $directorio -PathType Container)) { continue }
-        foreach ($archivo in @(Get-ChildItem -LiteralPath $directorio -File -Force -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -match '(?i)^ERRORLOG(?:\.\d+)?$|^SQLAGENT\.OUT$'
-        })) {
-            if ($archivo.LastWriteTime -ge $corte -and $archivo.Length -gt 0 -and $archivo.Length -le 20MB) {
-                $encontrados.Add($archivo)
-            }
-        }
-    } catch { }
-}
-$unicos = @{}
-foreach ($archivo in @($encontrados | Sort-Object LastWriteTime -Descending)) {
-    if (-not $unicos.ContainsKey($archivo.FullName)) { $unicos[$archivo.FullName] = $archivo }
-}
-[PSCustomObject]@{ Archivos = @($unicos.Values | Sort-Object LastWriteTime -Descending | Select-Object -First ([int]$config.MaxArchivos)) }
-'@
-    $busqueda = Invoke-ResponsiveWorker -ScriptText $codigoBusqueda -Arguments @($payload) `
-        -TimeoutSeconds 900 -Activity 'Buscando bitacoras CONTPAQi'
-    if (-not $busqueda.Correcto -or -not $busqueda.Resultado) {
-        Write-Log -Mensaje "No se completo la busqueda de bitacoras: $($busqueda.Error)" -Nivel WARN
-        return @()
-    }
-    return @($busqueda.Resultado.Archivos)
-}
-
-function Resolve-ErrorBitacoraCONTPAQi {
-    param([AllowEmptyString()][string]$Texto)
-    if ([string]::IsNullOrWhiteSpace($Texto)) { return $null }
-    $t = $Texto
-
-    if ($t -match '(?i)\b(0|zero)\s+(error|errors|errores)\b|\bsin\s+errores?\b|no\s+se\s+(detectaron|encontraron|presentaron)\s+errores?|error\s*(count|code|c[oó]digo)?\s*[:=]\s*0\b|errorlevel\s*[:=]\s*0\b|dbcc.*found\s+0\s+allocation\s+errors?.*0\s+consistency\s+errors?|error\s+log\s+has\s+been\s+reinitialized|logging\s+sql\s+server\s+messages\s+in\s+file|informational\s+message\s+only.*no\s+user\s+action\s+is\s+required') { return $null }
-
-    $categoria = $null
-    $severidad = 'MEDIA'
-    $diagnostico = ''
-    $solucion = ''
-    $accion = 'NINGUNA'
-    $confianza = 'Media'
-
-    if ($t -match '(?i)(\berror\s+82[345]\b|\berror\s+3414\b|severity\s+(2[1-5])\b|checksum|consistency\s+(error|check)|corrup(t|ci[oó]n)|dbcc\s+checkdb.*(fail|error)|torn\s+page|database.*(suspect|recovery\s+pending)|base\s+de\s+datos.*(sospechosa|recuperaci[oó]n\s+pendiente))') {
-        $categoria = 'Integridad de base de datos'; $severidad = 'CRITICA'; $confianza = 'Alta'
-        $diagnostico = 'SQL reporta posible dano fisico o logico en una base de datos.'
-        $solucion = 'Deten la operacion sobre la empresa, protege un respaldo verificable y ejecuta Mantenimiento SQL / CHECKDB. No uses REPAIR_ALLOW_DATA_LOSS ni edites tablas directamente.'
-    } elseif ($t -match '(?i)(\berror\s+9002\b|transaction\s+log.*(full|is\s+full)|log\s+de\s+transacciones.*lleno)') {
-        $categoria = 'Log de transacciones lleno'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'La base no puede registrar mas transacciones por crecimiento, espacio, respaldo de log o una transaccion abierta.'
-        $solucion = 'Valida espacio y autogrowth, modelo de recuperacion, respaldos del log y transacciones abiertas. No reduzcas archivos ni cambies el modelo sin definir la recuperacion.'
-    } elseif ($t -match '(?i)(\berror\s+(3201|3013)\b|backup.*(failed|failure|fall[oó])|cannot\s+open\s+backup\s+device)') {
-        $categoria = 'Respaldo SQL fallido'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'SQL no pudo crear o leer un respaldo por ruta, espacio, permisos o dispositivo.'
-        $solucion = 'Valida la ruta desde la cuenta del servicio SQL, espacio disponible y permisos del destino; despues genera y verifica un respaldo nuevo.'
-    } elseif ($t -match '(?i)(\berror\s+1205\b|deadlock\s+victim|interbloqueo)') {
-        $categoria = 'Interbloqueo SQL'; $severidad = 'MEDIA'; $confianza = 'Alta'
-        $diagnostico = 'SQL cancelo una transaccion porque dos procesos se bloquearon mutuamente.'
-        $solucion = 'Correlaciona usuarios y operacion, revisa indices/estadisticas y bloqueos repetitivos. Mantenimiento SQL puede ayudar, pero primero conserva la hora y base afectada.'
-    } elseif ($t -match '(?i)(disk\s+full|no\s+space\s+left|espacio\s+(en\s+disco\s+)?insuficiente|insufficient\s+disk|error\s+112\b|could\s+not\s+allocate\s+space)') {
-        $categoria = 'Espacio en disco'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'LIMPIAR_TEMP_CONTPAQ'
-        $diagnostico = 'El sistema no pudo escribir datos, temporales o respaldos por falta de espacio.'
-        $solucion = 'Libera espacio en la unidad afectada y valida crecimiento de archivos SQL. La reparacion automatica solo limpia temporales propios de CONTPAQi.'
-    } elseif ($t -match '(?i)(duplicate\s+key|clave\s+duplicada|duplicate\s+entry|[ií]ndice\s+duplicad|cannot\s+insert\s+duplicate)') {
-        $categoria = 'Llave o indice duplicado'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'La aplicacion intento guardar una llave que ya existe; puede ser una inconsistencia conocida o una version desactualizada.'
-        $solucion = 'Genera respaldo, valida la version/parches del producto y usa utilerias oficiales o soporte CONTPAQi. No elimines registros ni indices manualmente.'
-    } elseif ($t -match '(?i)(collation|conflict.*intercalaci[oó]n|intercalaci[oó]n.*conflict)') {
-        $categoria = 'Intercalacion SQL'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'Existe un conflicto de intercalacion entre SQL, tablas o expresiones.'
-        $solucion = 'Respalda y revisa la intercalacion con Configuracion ADD o las utilerias oficiales. No ejecutes ALTER masivos sin un plan de recuperacion.'
-    } elseif ($t -match '(?i)(\blogin\s+failed\b|error\s+18456\b|inicio\s+de\s+sesi[oó]n.*(fall|error)|usuario.*no.*asociado.*conexi[oó]n)') {
-        $categoria = 'Autenticacion SQL'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'SQL rechazo las credenciales o el modo de autenticacion configurado.'
-        $solucion = 'Confirma servidor/instancia, usuario, modo mixto y estado del login. No cambies contrasenas hasta identificar que configuracion consume cada sistema.'
-    } elseif ($t -match '(?i)(cannot\s+generate\s+sspi|sspi\s+context|principal\s+name\s+is\s+incorrect|nombre\s+principal.*incorrect)') {
-        $categoria = 'Identidad Windows / SSPI'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'Windows no pudo validar la identidad Kerberos usada para conectarse a SQL.'
-        $solucion = 'Valida hora, dominio, DNS, cuenta del servicio SQL y SPN. Prueba nombre FQDN e IP para aislar el problema; no reinicies SQL a ciegas.'
-    } elseif ($t -match '(?i)(host\s+not\s+found|no\s+se\s+pudo\s+resolver|name\s+or\s+service\s+not\s+known|dns.*(fail|error)|nombre.*servidor.*no.*encontr)') {
-        $categoria = 'Resolucion de nombre / DNS'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'LIMPIAR_DNS'
-        $diagnostico = 'El equipo no puede convertir el nombre del servidor en una IP valida.'
-        $solucion = 'Valida el nombre configurado, DNS e IP del servidor. Se puede limpiar la cache DNS local y volver a probar conectividad.'
-    } elseif ($t -match '(?i)(network-related|instance-specific|server\s+was\s+not\s+found|error\s+(26|40)\b|sql.*(connection|conexi[oó]n).*(fail|error|timeout)|no\s+se\s+pudo\s+(abrir|establecer).*(sql|base\s+de\s+datos))') {
-        $categoria = 'Conexion con SQL Server'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'INICIAR_SQL'
-        $diagnostico = 'La instancia SQL no responde, el nombre es incorrecto o la red/puerto bloquea la conexion.'
-        $solucion = 'Valida instancia, servicio SQL, SQL Browser cuando aplique, TCP/IP, firewall y conectividad con el servidor detectado.'
-    } elseif ($t -match '(?i)(msmq|message\s+queu(e|ing)|cola(s)?\s+de\s+mensajes?)') {
-        $categoria = 'Colas de mensajes MSMQ'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'INICIAR_MSMQ'
-        $diagnostico = 'La comunicacion interna de CONTPAQi no puede usar Microsoft Message Queuing.'
-        $solucion = 'Valida que la caracteristica MSMQ y su servicio esten instalados y activos. El Toolbox no elimina colas porque podrian contener trabajo pendiente.'
-    } elseif ($t -match '(?i)((licen(c|s)|appkey|authserver).*(error|fail|fall|no\s+se\s+pudo|denegad|vencid)|(error|fail|fall).*(licen(c|s)|appkey|authserver))') {
-        $categoria = 'Licenciamiento CONTPAQi'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'INICIAR_CONTPAQ'
-        $diagnostico = 'El sistema no puede validar la licencia o comunicarse con AuthServer/AppKey.'
-        $solucion = 'Valida servicios de licenciamiento, servidor configurado, puertos y que cliente/servidor tengan versiones compatibles.'
-    } elseif ($t -match '(?i)((saci|servidor\s+de\s+aplicaciones).*(error|fail|fall|timeout|interrump|no\s+se\s+pudo|rechaz)|(error|fail|fall|interrump).*(saci|servidor\s+de\s+aplicaciones))') {
-        $categoria = 'Servidor de aplicaciones SACI'; $severidad = 'ALTA'; $confianza = 'Alta'; $accion = 'INICIAR_CONTPAQ'
-        $diagnostico = 'Se interrumpio la comunicacion con el Servidor de Aplicaciones CONTPAQi.'
-        $solucion = 'Valida el servidor detectado, conectividad, puertos y servicios SACI. Si se requiere reinicio, cierra primero los sistemas y confirma que no haya usuarios trabajando.'
-    } elseif ($t -match '(?i)(access\s+denied|acceso\s+denegado|unauthori[sz]ed|permiso(s)?\s+(insuficiente|denegado)|no\s+tiene\s+permisos?)') {
-        $categoria = 'Permisos de archivos o Windows'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'La cuenta que ejecuta el sistema no tiene acceso al recurso indicado.'
-        $solucion = 'Identifica la ruta o recurso exacto y valida permisos de recurso compartido y NTFS. No otorgues Control total de forma general.'
-    } elseif ($t -match '(?i)(could\s+not\s+load\s+(file|assembly)|file\s+not\s+found|dll\s+not\s+found|no\s+se\s+encontr[oó].*(archivo|dll|m[oó]dulo)|m[oó]dulo.*no\s+se\s+encontr)') {
-        $categoria = 'Archivo o componente faltante'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'Falta un archivo, DLL o componente requerido, o su version no coincide.'
-        $solucion = 'Comprueba antivirus/cuarentena y ejecuta Reparar desde el instalador oficial de la misma version. No descargues DLL individuales de sitios externos.'
-    } elseif ($t -match '(?i)(timeout|timed\s+out|tiempo\s+de\s+espera|se\s+excedi[oó].*tiempo)') {
-        $categoria = 'Tiempo de espera agotado'; $severidad = 'MEDIA'; $confianza = 'Media'
-        $diagnostico = 'Una operacion tardo mas de lo permitido por red, carga del servidor, bloqueo o consulta lenta.'
-        $solucion = 'Correlaciona la hora con SQL, red y eventos de Windows; revisa bloqueos, recursos y latencia antes de aumentar tiempos de espera.'
-    } elseif ($t -match '(?i)(outofmemory|out\s+of\s+memory|memoria\s+insuficiente)') {
-        $categoria = 'Memoria insuficiente'; $severidad = 'ALTA'; $confianza = 'Alta'
-        $diagnostico = 'El proceso o el sistema operativo no pudo reservar memoria.'
-        $solucion = 'Revisa memoria disponible, procesos CONTPAQi/SQL y paginacion. Actualiza el sistema si el fallo se repite con una operacion concreta.'
-    } elseif ($t -match '(?i)(unhandled\s+exception|nullreference|stackoverflow|excepci[oó]n\s+no\s+controlada|\bfatal\b|\bcritical\b)') {
-        $categoria = 'Excepcion de la aplicacion'; $severidad = 'ALTA'; $confianza = 'Media'
-        $diagnostico = 'Un modulo termino de forma inesperada; el texto y la hora permiten ubicar el componente responsable.'
-        $solucion = 'Repite el flujo controladamente, valida version/parches y correlaciona con servicios, SQL y Visor de eventos.'
-    } elseif ($t -match '(?i)(\bexception\b|\berror\b|\bfailed\b|\bfailure\b|\bfall[oó]\b|\bfallido\b|no\s+se\s+pudo)') {
-        $categoria = 'Error de aplicacion'; $severidad = 'MEDIA'; $confianza = 'Media'
-        $diagnostico = 'La bitacora registro una operacion fallida que requiere correlacion con su modulo y hora.'
-        $solucion = 'Revisa el origen mostrado, el paso que ejecutaba el usuario y los eventos de Windows de la misma hora. Conserva esta evidencia antes de reparar.'
-    }
-
-    if (-not $categoria) { return $null }
-    return [PSCustomObject]@{
-        Categoria  = $categoria
-        Severidad  = $severidad
-        Diagnostico = $diagnostico
-        Solucion   = $solucion
-        Accion     = $accion
-        Confianza  = $confianza
-    }
-}
-
-function Get-FirmaErrorBitacoraCONTPAQi {
-    param([string]$Texto, [string]$Categoria)
-    $firma = (Protect-TextoBitacoraCONTPAQi -Texto $Texto -LongitudMaxima 500).ToLowerInvariant()
-    $firma = $firma -replace '\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', '<fecha>'
-    $firma = $firma -replace '\b\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\s*(a\.?\s*m\.?|p\.?\s*m\.?)?\b', '<hora>'
-    $firma = $firma -replace '\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b', '<guid>'
-    $firma = $firma -replace '\b\d{4,}\b', '<n>'
-    $firma = $firma -replace '\s+', ' '
-    return "$Categoria|$($firma.Trim())"
-}
-
-function Get-FechaTextoBitacoraCONTPAQi {
-    param([string]$Texto, [datetime]$FechaPredeterminada)
-    if ([string]::IsNullOrWhiteSpace($Texto)) { return $FechaPredeterminada }
-    $coincidencia = [regex]::Match($Texto, '(?i)\b(?<fecha>(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})\s+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:\s*[ap]\.?\s*m\.?)?)')
-    if (-not $coincidencia.Success) { return $FechaPredeterminada }
-    $valor = $coincidencia.Groups['fecha'].Value -replace '(?i)a\.?\s*m\.?', 'AM' -replace '(?i)p\.?\s*m\.?', 'PM'
-    $fecha = [datetime]::MinValue
-    foreach ($cultura in @([Globalization.CultureInfo]::CurrentCulture, [Globalization.CultureInfo]::InvariantCulture, [Globalization.CultureInfo]::GetCultureInfo('es-MX'))) {
-        if ([datetime]::TryParse($valor, $cultura, [Globalization.DateTimeStyles]::AllowWhiteSpaces, [ref]$fecha)) { return $fecha }
-    }
-    return $FechaPredeterminada
-}
-
-function Get-AnalisisBitacorasCONTPAQi {
-    param(
-        [ValidateRange(1, 365)][int]$Dias = 30,
-        [ValidateRange(10, 500)][int]$MaxArchivos = 150,
-        [ValidateRange(100, 10000)][int]$LineasPorArchivo = 2000,
-        [ValidateRange(5, 100)][int]$MaxHallazgos = 35
-    )
-    $archivos = @(Get-ArchivosBitacoraCONTPAQi -Dias $Dias -MaxArchivos $MaxArchivos)
-    $hallazgosCrudos = New-Object System.Collections.Generic.List[object]
-    $lineasRevisadas = 0
-    $eventosRevisados = 0
-    $patronCandidato = '(?i)(\berror\b|\bexception\b|\bfatal\b|\bcritical\b|\bfailed\b|\bfailure\b|\bfall[oó]\b|\bfallido\b|no\s+se\s+pudo|could\s+not|not\s+found|denegad|access\s+denied|unauthori[sz]ed|timeout|timed\s+out|tiempo\s+de\s+espera|checksum|corrup|18456|82[345]|3414|9002|3201|3013|1205|severity\s+2[1-5]|suspect|recovery\s+pending|deadlock|interbloqueo|sspi|duplicate\s+key|clave\s+duplicada|collation|intercalaci[oó]n|msmq|message\s+queu|disk\s+full|no\s+space|out\s+of\s+memory|memoria\s+insuficiente|network-related|instance-specific|host\s+not\s+found|interrump|vencid)'
-
-    foreach ($archivo in $archivos) {
-        try {
-            $lineas = @(Get-Content -LiteralPath $archivo.FullName -Tail $LineasPorArchivo -ErrorAction Stop)
-            $lineasRevisadas += $lineas.Count
-            for ($i = 0; $i -lt $lineas.Count; $i++) {
-                if (($i % 250) -eq 0) { Refresh-Log }
-                $linea = [string]$lineas[$i]
-                if ([string]::IsNullOrWhiteSpace($linea) -or $linea -notmatch $patronCandidato) { continue }
-                $fragmentos = New-Object System.Collections.Generic.List[string]
-                $fragmentos.Add($linea)
-                for ($avance = 1; $avance -le 2 -and ($i + $avance) -lt $lineas.Count; $avance++) {
-                    $siguiente = [string]$lineas[$i + $avance]
-                    if ([string]::IsNullOrWhiteSpace($siguiente)) { break }
-                    $esContinuacion = ($siguiente -match '(?i)^\s*(at\s|en\s|--->|caused\s+by|inner\s*exception|detalle\s*[:=]|message\s*[:=]|mensaje\s*[:=]|system\.[a-z].*exception)')
-                    if (-not $esContinuacion -and $linea.Length -ge 100) { break }
-                    if ($siguiente -match '^\s*\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\s+\d{1,2}:\d{2}' -and -not $esContinuacion) { break }
-                    $fragmentos.Add($siguiente.Trim())
-                }
-                $texto = Protect-TextoBitacoraCONTPAQi -Texto ($fragmentos -join ' | ')
-                $regla = Resolve-ErrorBitacoraCONTPAQi -Texto $texto
-                if (-not $regla) { continue }
-                $hallazgosCrudos.Add([PSCustomObject]@{
-                    Fecha = Get-FechaTextoBitacoraCONTPAQi -Texto $linea -FechaPredeterminada $archivo.LastWriteTime
-                    Fuente = $archivo.FullName; TipoFuente = 'Archivo'
-                    Texto = $texto; Categoria = $regla.Categoria; Severidad = $regla.Severidad
-                    Diagnostico = $regla.Diagnostico; Solucion = $regla.Solucion
-                    Accion = $regla.Accion; Confianza = $regla.Confianza
-                    Firma = Get-FirmaErrorBitacoraCONTPAQi -Texto $texto -Categoria $regla.Categoria
-                })
-            }
-        } catch { }
-        Refresh-Log
-    }
-
-    foreach ($nombreLog in @('Application', 'System')) {
-        try {
-            $eventos = @(Get-WinEvent -FilterHashtable @{ LogName = $nombreLog; StartTime = (Get-Date).AddDays(-[Math]::Min($Dias, 14)); Level = @(1, 2, 3) } -MaxEvents 350 -ErrorAction Stop)
-            $eventosRevisados += $eventos.Count
-            $indiceEvento = 0
-            foreach ($evento in $eventos) {
-                $indiceEvento++
-                if (($indiceEvento % 50) -eq 0) { Refresh-Log }
-                $mensaje = Protect-TextoBitacoraCONTPAQi -Texto $evento.Message
-                $relacionado = ($evento.ProviderName -match '(?i)CONTPAQ|COMPAC|SACI|APPKEY|AUTHSERVER|MSSQL|SQLSERVER|SQLBROWSER|MSMQ') -or
-                    ($mensaje -match '(?i)CONTPAQ|COMPAC|SACI|APPKEY|AUTHSERVER|SQL\s+SERVER|MSMQ')
-                if (-not $relacionado) { continue }
-                $regla = Resolve-ErrorBitacoraCONTPAQi -Texto $mensaje
-                if (-not $regla) { continue }
-                $fuente = "Visor de eventos/$nombreLog/$($evento.ProviderName) (Id $($evento.Id))"
-                $hallazgosCrudos.Add([PSCustomObject]@{
-                    Fecha = $evento.TimeCreated; Fuente = $fuente; TipoFuente = 'Evento'
-                    Texto = $mensaje; Categoria = $regla.Categoria; Severidad = $regla.Severidad
-                    Diagnostico = $regla.Diagnostico; Solucion = $regla.Solucion
-                    Accion = $regla.Accion; Confianza = $regla.Confianza
-                    Firma = Get-FirmaErrorBitacoraCONTPAQi -Texto $mensaje -Categoria $regla.Categoria
-                })
-            }
-        } catch { }
-    }
-
-    $agrupados = New-Object System.Collections.Generic.List[object]
-    foreach ($grupo in @($hallazgosCrudos | Group-Object Firma)) {
-        $ultimo = @($grupo.Group | Sort-Object Fecha -Descending | Select-Object -First 1)[0]
-        $fuentes = @($grupo.Group | Select-Object -ExpandProperty Fuente -Unique)
-        $agrupados.Add([PSCustomObject]@{
-            Fecha = $ultimo.Fecha; Fuente = $ultimo.Fuente; Fuentes = $fuentes
-            TipoFuente = $ultimo.TipoFuente; Texto = $ultimo.Texto
-            Categoria = $ultimo.Categoria; Severidad = $ultimo.Severidad
-            Diagnostico = $ultimo.Diagnostico; Solucion = $ultimo.Solucion
-            Accion = $ultimo.Accion; Confianza = $ultimo.Confianza
-            Repeticiones = $grupo.Count
-        })
-    }
-    $ordenados = @($agrupados | Sort-Object @{ Expression = {
-        switch ($_.Severidad) { 'CRITICA' { 0 } 'ALTA' { 1 } default { 2 } }
-    } }, @{ Expression = { $_.Fecha }; Descending = $true } | Select-Object -First $MaxHallazgos)
-
-    return [PSCustomObject]@{
-        Dias = $Dias; Archivos = $archivos; ArchivosRevisados = $archivos.Count
-        LineasRevisadas = $lineasRevisadas; EventosRevisados = $eventosRevisados
-        Hallazgos = $ordenados; HallazgosTotales = $hallazgosCrudos.Count
-    }
-}
-
-function Invoke-ReparacionesBitacoraCONTPAQi {
-    param([object[]]$Hallazgos)
-    $accionesSolicitadas = @($Hallazgos | Where-Object { $_.Accion -and $_.Accion -ne 'NINGUNA' } | Select-Object -ExpandProperty Accion -Unique)
-    $acciones = New-Object System.Collections.Generic.List[object]
-
-    if ('INICIAR_SQL' -in $accionesSolicitadas -and (Get-PerfilEquipo) -match 'Servidor') {
-        foreach ($servicio in @(Get-ServiciosMotorSQL | Where-Object { $_.Status -ne 'Running' -and $_.StartType -ne 'Disabled' })) {
-            $acciones.Add([PSCustomObject]@{ Codigo = 'SERVICIO'; Objetivo = $servicio.Name; Descripcion = "Iniciar motor SQL detenido: $($servicio.Name)" })
-        }
-        $browser = Get-Service -Name 'SQLBrowser' -ErrorAction SilentlyContinue
-        if ($browser -and $browser.Status -ne 'Running' -and $browser.StartType -ne 'Disabled') {
-            $acciones.Add([PSCustomObject]@{ Codigo = 'SERVICIO'; Objetivo = $browser.Name; Descripcion = 'Iniciar SQL Server Browser detenido' })
-        }
-    }
-    if ('INICIAR_CONTPAQ' -in $accionesSolicitadas) {
-        foreach ($servicio in @(Get-ServiciosCONTPAQiDetectados | Where-Object {
-            $_.Status -ne 'Running' -and $_.StartType -ne 'Disabled' -and
-            ($_.Name -notmatch '^MSSQL|^SQLBrowser$')
-        })) {
-            $acciones.Add([PSCustomObject]@{ Codigo = 'SERVICIO'; Objetivo = $servicio.Name; Descripcion = "Iniciar servicio CONTPAQi detenido: $($servicio.Name)" })
-        }
-    }
-    if ('INICIAR_MSMQ' -in $accionesSolicitadas) {
-        $msmq = Get-Service -Name 'MSMQ' -ErrorAction SilentlyContinue
-        if ($msmq -and $msmq.Status -ne 'Running' -and $msmq.StartType -ne 'Disabled') {
-            $acciones.Add([PSCustomObject]@{ Codigo = 'SERVICIO'; Objetivo = 'MSMQ'; Descripcion = 'Iniciar Microsoft Message Queuing (MSMQ)' })
-        }
-    }
-    if ('LIMPIAR_DNS' -in $accionesSolicitadas) {
-        $acciones.Add([PSCustomObject]@{ Codigo = 'DNS'; Objetivo = ''; Descripcion = 'Limpiar la cache DNS local' })
-    }
-    if ('LIMPIAR_TEMP_CONTPAQ' -in $accionesSolicitadas) {
-        $temp = Get-TamanoCarpetasTemporalesCONTPAQi
-        if ($temp.Bytes -gt 0) {
-            $acciones.Add([PSCustomObject]@{ Codigo = 'TEMP'; Objetivo = ''; Descripcion = "Limpiar solo temporales CONTPAQi ($($temp.MB) MB)" })
-        }
-    }
-
-    $accionesUnicas = @($acciones | Sort-Object Codigo, Objetivo -Unique)
-    if ($accionesUnicas.Count -eq 0) {
-        Write-Log -Mensaje 'No hay cambios automaticos aplicables. El diagnostico conserva pasos manuales seguros.' -Nivel INFO
-        return
-    }
-
-    Write-SeccionMenu -Titulo 'REPARACIONES SEGURAS DISPONIBLES' -Color 'Green'
-    foreach ($accion in $accionesUnicas) { Write-Log -Mensaje $accion.Descripcion -Nivel INFO }
-    Write-Log -Mensaje 'No se modificaran bases, colas MSMQ, permisos ni archivos de programa.' -Nivel WARN
-    if (-not (Confirmar-Movimiento -Frase 'APLICAR REPARACIONES' `
-        -Accion "Aplicar $($accionesUnicas.Count) reparacion(es) sugerida(s) por las bitacoras" `
-        -Detalle 'Se iniciaran servicios y/o se limpiaran DNS y temporales, segun los hallazgos mostrados.')) {
-        Write-Log -Mensaje 'Diagnostico finalizado sin realizar cambios.' -Nivel INFO
-        return
-    }
-
-    $correctas = 0; $fallidas = 0
-    foreach ($accion in $accionesUnicas) {
-        try {
-            switch ($accion.Codigo) {
-                'SERVICIO' {
-                    $resultadoServicio = Invoke-ServiceActionResponsive -Nombre $accion.Objetivo -Accion Start -TimeoutSegundos 75
-                    if (-not $resultadoServicio.Correcto) { throw $resultadoServicio.Error }
-                }
-                'DNS' {
-                    $resultadoDns = Invoke-DnsFlushResponsive
-                    if (-not $resultadoDns.Correcto) { throw $resultadoDns.Error }
-                }
-                'TEMP' {
-                    $eliminados = 0
-                    foreach ($ruta in (Get-TamanoCarpetasTemporalesCONTPAQi).Rutas) { $eliminados += Clear-TemporalSeguro -Ruta $ruta }
-                    Write-Log -Mensaje "Temporales retirados: $eliminados elemento(s)." -Nivel OK
-                }
-            }
-            $correctas++
-            Write-Log -Mensaje "$($accion.Descripcion): verificado." -Nivel OK
-        } catch {
-            $fallidas++
-            Write-Log -Mensaje "$($accion.Descripcion): $($_.Exception.Message)" -Nivel ERROR
-        }
-    }
-    Write-Log -Mensaje "Resultado de reparacion: $correctas correcta(s), $fallidas fallida(s)." -Nivel $(if ($fallidas -eq 0) { 'OK' } else { 'WARN' })
-}
-
-function Invoke-AnalisisBitacorasCONTPAQi {
-    Write-Encabezado -Titulo 'ANALISIS DE ERRORES CONTPAQi' -Subtitulo 'Bitacoras y eventos del equipo actual' -Color 'Cyan'
-    Write-Log -Mensaje "Buscando evidencia local de los ultimos 30 dias en $env:COMPUTERNAME..." -Nivel PROGRESS
-    $analisis = Get-AnalisisBitacorasCONTPAQi -Dias 30 -MaxArchivos 150 -LineasPorArchivo 2500 -MaxHallazgos 35
-
-    Write-SeccionMenu -Titulo 'COBERTURA' -Color 'Magenta'
-    Write-Log -Mensaje "Archivos revisados: $($analisis.ArchivosRevisados) | Lineas recientes: $($analisis.LineasRevisadas) | Eventos de Windows: $($analisis.EventosRevisados)" -Nivel INFO
-    if ($analisis.ArchivosRevisados -eq 0) {
-        Write-Log -Mensaje 'No se localizaron bitacoras recientes en las rutas conocidas de CONTPAQi.' -Nivel WARN
-    } else {
-        foreach ($archivo in @($analisis.Archivos | Select-Object -First 8)) {
-            Write-Log -Mensaje "Bitacora: $($archivo.FullName) | $($archivo.LastWriteTime.ToString('dd/MM/yyyy HH:mm'))" -Nivel INFO
-        }
-        if ($analisis.ArchivosRevisados -gt 8) {
-            Write-Log -Mensaje "... y $($analisis.ArchivosRevisados - 8) archivo(s) adicional(es)." -Nivel INFO
-        }
-    }
-
-    $hallazgos = @($analisis.Hallazgos)
-    if ($hallazgos.Count -eq 0) {
-        Write-SeccionMenu -Titulo 'RESULTADO' -Color 'Green'
-        Write-Log -Mensaje 'No se encontraron errores reconocibles en la evidencia reciente.' -Nivel OK
-        Write-Log -Mensaje 'Esto no descarta un problema sin bitacora; reproduce el fallo y ejecuta nuevamente este analisis.' -Nivel INFO
-        return
-    }
-
-    Write-SeccionMenu -Titulo 'ERRORES, PISTAS Y SOLUCIONES' -Color 'Red'
-    $indice = 0
-    foreach ($hallazgo in $hallazgos) {
-        $indice++
-        $nivel = if ($hallazgo.Severidad -eq 'CRITICA') { 'ERROR' } elseif ($hallazgo.Severidad -eq 'ALTA') { 'WARN' } else { 'INFO' }
-        Write-Log -Mensaje "#$indice [$($hallazgo.Severidad)] $($hallazgo.Categoria) | Repeticiones: $($hallazgo.Repeticiones) | Ultimo: $($hallazgo.Fecha.ToString('dd/MM/yyyy HH:mm'))" -Nivel $nivel
-        Write-Log -Mensaje "Fuente: $($hallazgo.Fuente)" -Nivel INFO
-        Write-Log -Mensaje "Error detectado: $($hallazgo.Texto)" -Nivel $nivel
-        Write-Log -Mensaje "Pista ($($hallazgo.Confianza)): $($hallazgo.Diagnostico)" -Nivel INFO
-        Write-Log -Mensaje "Solucion sugerida: $($hallazgo.Solucion)" -Nivel INFO
-        if ($hallazgo.Accion -ne 'NINGUNA') {
-            Write-Log -Mensaje 'Hay una reparacion local segura que puede evaluarse al final.' -Nivel OK
-        }
-        Write-Host ''
-    }
-
-    $criticas = @($hallazgos | Where-Object Severidad -eq 'CRITICA').Count
-    $altas = @($hallazgos | Where-Object Severidad -eq 'ALTA').Count
-    $medias = @($hallazgos | Where-Object Severidad -eq 'MEDIA').Count
-    Write-Separador -Color $(if ($criticas -gt 0) { $Script:ColorError } else { $Script:ColorAdvertencia })
-    Write-Log -Mensaje "RESUMEN: $criticas critica(s), $altas alta(s), $medias media(s) | $($analisis.HallazgosTotales) registro(s) agrupados en $($hallazgos.Count) causa(s)." -Nivel $(if ($criticas -gt 0) { 'ERROR' } else { 'WARN' })
-    if ($criticas -gt 0) {
-        Write-Log -Mensaje 'Se detecto riesgo de integridad: no se aplicaran cambios automaticos sobre bases de datos.' -Nivel ERROR
-    }
-    Invoke-ReparacionesBitacoraCONTPAQi -Hallazgos $hallazgos
-}
-
-function Invoke-EscaneoInteligenteCONTPAQi {
-    Write-Encabezado -Titulo 'ESCANEO Y REPARACION LOCAL' -Subtitulo 'Diagnostico y reparacion del equipo actual' -Color 'Cyan'
-    $inicio = Get-Date
-    $alertas = 0
-    $advertencias = 0
-    $serviciosReparables = @()
-
-    Write-SeccionMenu -Titulo '1. PRODUCTOS Y RUTAS' -Color 'Magenta'
-    $productos = @(Get-ProgramasInstalados | Where-Object {
-        $_.DisplayName -match '(?i)CONTPAQ|COMPAC|APPKEY|SACI|XML\s*EN\s*L[IÍ]NEA|MICROSOFT SQL SERVER|SQL SERVER NATIVE CLIENT|ODBC DRIVER.*SQL'
-    } | Sort-Object DisplayName, DisplayVersion -Unique)
-    if ($productos.Count -eq 0) {
-        $advertencias++
-        Write-Log -Mensaje 'No se detectaron productos CONTPAQi en el registro de programas.' -Nivel WARN
-    } else {
-        $gruposProductos = @($productos | Group-Object -Property {
-            Get-FabricanteSistemaCONTPAQi -Nombre $_.DisplayName -Editor $_.Publisher
-        } | Sort-Object Name)
-        foreach ($grupo in $gruposProductos) {
-            Write-Log -Mensaje "SISTEMAS - $($grupo.Name.ToUpper()) ($($grupo.Count))" -Nivel INFO
-            foreach ($producto in @($grupo.Group | Sort-Object DisplayName, DisplayVersion)) {
-                $version = if ($producto.DisplayVersion) { $producto.DisplayVersion } else { 'N/D' }
-                Write-Log -Mensaje "Sistema: $($producto.DisplayName) | Version $version" -Nivel OK
-            }
-        }
-    }
-    $rutas = @(Get-RutasCONTPAQi)
-    foreach ($ruta in $rutas) { Write-Log -Mensaje "Ruta detectada: $ruta" -Nivel INFO }
-
-    Write-SeccionMenu -Titulo '2. SERVICIOS Y EJECUTABLES' -Color 'Green'
-    $servicios = @(Get-ServiciosCONTPAQiDetectados)
-    if ($servicios.Count -eq 0) {
-        $advertencias++
-        Write-Log -Mensaje 'No se detectaron servicios CONTPAQi o motores SQL.' -Nivel WARN
-    }
-    $gruposServicios = @($servicios | Group-Object -Property {
-        $esMotor = ($_.Name -eq 'MSSQLSERVER' -or $_.Name -match '^MSSQL\$[^$]+$')
-        Get-FabricanteServicioCONTPAQi -Nombre $_.Name -DisplayName $_.DisplayName -Ruta '' -EsMotorSQL $esMotor
-    } | Sort-Object Name)
-    foreach ($grupo in $gruposServicios) {
-        Write-Log -Mensaje "SERVICIOS - $($grupo.Name.ToUpper()) ($($grupo.Count))" -Nivel INFO
-        foreach ($servicio in @($grupo.Group | Sort-Object Name)) {
-            $nivel = if ($servicio.Status -eq 'Running') { 'OK' } else { 'WARN' }
-            Write-Log -Mensaje "Servicio: $($servicio.Name) | $($servicio.Status) | Inicio: $($servicio.StartType)" -Nivel $nivel
-            if ($servicio.Status -ne 'Running') {
-                $advertencias++
-                if (-not (Test-ServicioDeshabilitado -Nombre $servicio.Name)) { $serviciosReparables += $servicio.Name }
-            }
-            try {
-                $cimServicio = Get-CimInstance Win32_Service -Filter "Name='$($servicio.Name)'" -ErrorAction Stop
-                $rutaExe = Get-RutaEjecutableServicio -Comando $cimServicio.PathName
-                if ($rutaExe -and -not (Test-Path -LiteralPath $rutaExe -PathType Leaf)) {
-                    $alertas++
-                    Write-Log -Mensaje "$($servicio.Name): ejecutable ausente en $rutaExe" -Nivel ERROR
-                }
-            } catch {
-                Write-Log -Mensaje "$($servicio.Name): no se pudo validar la ruta binaria." -Nivel INFO
-            }
-        }
-    }
-    foreach ($servicioApp in @(Get-ServiciosAplicacionCONTPAQi | Where-Object {
-        $_.Status -ne 'Running' -and -not (Test-ServicioDeshabilitado -Nombre $_.Name)
-    })) {
-        $serviciosReparables += $servicioApp.Name
-    }
-    $serviciosReparables = @($serviciosReparables | Select-Object -Unique)
-
-    Write-SeccionMenu -Titulo '3. SQL SERVER' -Color 'Green'
-    $motores = @(Get-ServiciosMotorSQL)
-    foreach ($motor in $motores) {
-        $instancia = Get-NombreInstanciaSQL -NombreServicio $motor.Name
-        if ($motor.Status -ne 'Running') {
-            $alertas++
-            Write-Log -Mensaje "$instancia detenido; no se puede validar la base de datos." -Nivel ERROR
-            continue
-        }
-        $pruebaSql = Test-ConexionSQLLocal -Instancia $instancia -TimeoutSegundos 4
-        if ($pruebaSql.Correcto) {
-            Write-Log -Mensaje "$instancia responde | SQL $($pruebaSql.Version) | $($pruebaSql.Servidor)" -Nivel OK
-        } else {
-            $alertas++
-            Write-Log -Mensaje "$instancia no acepta conexion integrada: $($pruebaSql.Error)" -Nivel ERROR
-        }
-    }
-
-    Write-SeccionMenu -Titulo '4. RECURSOS, EVENTOS Y TEMPORALES' -Color 'Yellow'
-    foreach ($unidad in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null })) {
-        $libreGB = [math]::Round($unidad.Free / 1GB, 1)
-        $nivelDisco = if ($libreGB -ge 10) { 'OK' } else { 'WARN' }
-        if ($libreGB -lt 10) { $advertencias++ }
-        Write-Log -Mensaje "Unidad $($unidad.Name): $libreGB GB libres." -Nivel $nivelDisco
-    }
-    if (Test-ReinicioPendiente) {
-        $advertencias++
-        Write-Log -Mensaje 'Windows tiene un reinicio pendiente.' -Nivel WARN
-    } else {
-        Write-Log -Mensaje 'Sin reinicio pendiente.' -Nivel OK
-    }
-    $analisisLogs = Get-AnalisisBitacorasCONTPAQi -Dias 7 -MaxArchivos 80 -LineasPorArchivo 1000 -MaxHallazgos 12
-    $hallazgosLogs = @($analisisLogs.Hallazgos)
-    if ($hallazgosLogs.Count -gt 0) {
-        $criticosLogs = @($hallazgosLogs | Where-Object Severidad -eq 'CRITICA').Count
-        $altosLogs = @($hallazgosLogs | Where-Object Severidad -eq 'ALTA').Count
-        if ($criticosLogs -gt 0) { $alertas += [Math]::Min(2, $criticosLogs) } else { $advertencias++ }
-        Write-Log -Mensaje "Bitacoras: $($hallazgosLogs.Count) causa(s) reciente(s) | $criticosLogs critica(s) | $altosLogs alta(s)." -Nivel $(if ($criticosLogs -gt 0) { 'ERROR' } else { 'WARN' })
-        foreach ($categoria in @($hallazgosLogs | Group-Object Categoria | Sort-Object Count -Descending | Select-Object -First 3)) {
-            Write-Log -Mensaje "Pista: $($categoria.Name) ($($categoria.Count))" -Nivel INFO
-        }
-        Write-Log -Mensaje 'Abre la carpeta de reportes para consultar el mensaje exacto y conservar evidencia del escaneo.' -Nivel INFO
-    } else {
-        Write-Log -Mensaje "Bitacoras: sin errores reconocibles en $($analisisLogs.ArchivosRevisados) archivo(s) y $($analisisLogs.EventosRevisados) evento(s) revisados." -Nivel OK
-    }
-    $temporales = Get-TamanoCarpetasTemporalesCONTPAQi
-    Write-Log -Mensaje "Temporales especificos de CONTPAQi: $($temporales.MB) MB." -Nivel $(if ($temporales.MB -ge 250) { 'WARN' } else { 'OK' })
-    $limpiarTemporales = ($temporales.MB -ge 250)
-    if ($limpiarTemporales) { $advertencias++ }
-
-    $puntaje = [math]::Max(0, 100 - ($alertas * 15) - ($advertencias * 5))
-    $duracion = [math]::Round(((Get-Date) - $inicio).TotalSeconds, 1)
-    Write-Separador -Color $(if ($puntaje -ge 80) { $Script:ColorExito } elseif ($puntaje -ge 55) { $Script:ColorAdvertencia } else { $Script:ColorError })
-    Write-Log -Mensaje "SALUD DEL EQUIPO: $puntaje/100 | $alertas alerta(s) | $advertencias advertencia(s) | $duracion s" -Nivel $(if ($puntaje -ge 80) { 'OK' } elseif ($puntaje -ge 55) { 'WARN' } else { 'ERROR' })
-
-    $cantidadReparaciones = $serviciosReparables.Count + $(if ($limpiarTemporales) { 1 } else { 0 })
-    if ($cantidadReparaciones -eq 0) {
-        Write-Log -Mensaje 'No se encontraron reparaciones automaticas seguras pendientes.' -Nivel OK
-        Write-Log -Mensaje 'Si la incidencia continua, abre las bitacoras y revisa el detalle del escaneo.' -Nivel INFO
-        return
-    }
-
-    Write-SeccionMenu -Titulo 'REPARACIONES SEGURAS DISPONIBLES' -Color 'Green'
-    foreach ($nombre in $serviciosReparables) { Write-Log -Mensaje "Iniciar y verificar servicio detenido: $nombre" -Nivel INFO }
-    if ($limpiarTemporales) { Write-Log -Mensaje 'Limpiar solo temporales de CONTPAQi/Compac.' -Nivel INFO }
-    if (-not (Confirmar-Movimiento -Frase 'APLICAR REPARACIONES' `
-        -Accion "Aplicar $cantidadReparaciones reparacion(es) del escaneo" `
-        -Detalle 'Se iniciaran los servicios detenidos detectados y/o se limpiaran temporales CONTPAQi.')) {
-        Write-Log -Mensaje 'Escaneo terminado sin realizar cambios.' -Nivel INFO
-        return
-    }
-
-    $reparadas = 0
-    $fallidas = 0
-    $nombresApp = @(Get-ServiciosAplicacionCONTPAQi | Select-Object -ExpandProperty Name -Unique)
-    $appPendientes = @($serviciosReparables | Where-Object { $_ -in $nombresApp })
-    if ($appPendientes.Count -gt 0) {
-        $resultadoApp = Start-TodosServiciosCONTPAQiVerificado
-        $fallosApp = @($appPendientes | Where-Object { $_ -in $resultadoApp.FallidosNombres })
-        $reparadas += ($appPendientes.Count - $fallosApp.Count)
-        $fallidas += $resultadoApp.Fallidos
-        Write-Log -Mensaje "Comprobacion final CONTPAQi: $($resultadoApp.Correctos) activo(s), $($resultadoApp.Fallidos) con incidencia." -Nivel $(if ($resultadoApp.Fallidos -eq 0) { 'OK' } else { 'WARN' })
-    }
-
-    $otrosPendientes = @($serviciosReparables | Where-Object { $_ -notin $nombresApp } | Sort-Object {
-        if ($_ -match '^MSSQL') { return -2 }
-        if ($_ -eq 'SQLBrowser') { return -1 }
-        return 0
-    })
-    foreach ($nombre in $otrosPendientes) {
-        $resultadoInicio = Invoke-ServiceActionResponsive -Nombre $nombre -Accion Start -TimeoutSegundos 90
-        if ($resultadoInicio.Correcto) {
-            $reparadas++
-            Write-Log -Mensaje "$nombre iniciado y verificado." -Nivel OK
-        } else {
-            $fallidas++
-            Write-Log -Mensaje "No se pudo iniciar $($nombre): $($resultadoInicio.Error)" -Nivel ERROR
-        }
-    }
-    if ($limpiarTemporales) {
-        $eliminados = 0
-        foreach ($ruta in $temporales.Rutas) { $eliminados += Clear-TemporalSeguro -Ruta $ruta }
-        $reparadas++
-        Write-Log -Mensaje "Temporales limpiados: $eliminados elemento(s)." -Nivel OK
-    }
-    Write-Separador -Color $(if ($fallidas -eq 0) { $Script:ColorExito } else { $Script:ColorAdvertencia })
-    Write-Log -Mensaje "REPARACION FINAL: $reparadas correcta(s), $fallidas fallida(s)." -Nivel $(if ($fallidas -eq 0) { 'OK' } else { 'WARN' })
-}
 
 # --- DESINSTALACION DE SISTEMAS CONTPAQi ---
 
@@ -8154,13 +8703,22 @@ function Show-Accion {
         [scriptblock]$Accion,
         [string]$Color = 'Cyan'
     )
-    if ($Script:IsBusy) { return }
+    if ($Script:IsBusy) {
+        if ($Script:StatusLabel) { $Script:StatusLabel.Text = ' Hay una operacion en curso; espera a que finalice.' }
+        [System.Media.SystemSounds]::Exclamation.Play()
+        return
+    }
     if ($Script:GUIForm -and -not $Script:ConsoleMode) {
         Close-CurrentPanel
         $Script:LogBox.Clear()
         [System.Windows.Forms.Application]::DoEvents()
     }
     $Script:IsBusy = $true
+    if ($Script:Sidebar) {
+        foreach ($control in $Script:Sidebar.Controls) {
+            if ($control -is [System.Windows.Forms.Button]) { $control.Enabled = $false }
+        }
+    }
     if ($Script:GUIForm) {
         $Script:GUIForm.UseWaitCursor = $true
         if ($Script:StatusLabel) {
@@ -8183,6 +8741,11 @@ function Show-Accion {
             $Script:GUIForm.Activate()
         }
         $Script:IsBusy = $false
+        if ($Script:Sidebar -and -not $Script:Sidebar.IsDisposed) {
+            foreach ($control in $Script:Sidebar.Controls) {
+                if ($control -is [System.Windows.Forms.Button]) { $control.Enabled = $true }
+            }
+        }
         Write-BarraEstado
     }
 }
@@ -8192,12 +8755,13 @@ function Show-Bienvenida {
     Write-Log -Mensaje 'La herramienta esta lista para trabajar.' -Nivel OK
     Write-Host ''
     Write-SeccionMenu -Titulo 'FLUJO RECOMENDADO' -Color 'Green'
-    Write-Log -Mensaje '1. Ejecuta Escaneo y Reparacion para revisar solamente este equipo.' -Nivel INFO
-    Write-Log -Mensaje '2. Usa Diagnostico de Red para separar fallas locales, DNS, firewall, SQL o servicios remotos.' -Nivel INFO
-    Write-Log -Mensaje '3. Usa Reparar Terminal para recuperar servicios, temporales, red y comunicacion de la estacion.' -Nivel INFO
-    Write-Log -Mensaje '4. Usa Analisis del Servidor para localizarlo y obtener su inventario remoto.' -Nivel INFO
-    Write-Log -Mensaje '5. Para una base lenta o inestable, usa Mantenimiento SQL directamente en el servidor.' -Nivel INFO
-    Write-Log -Mensaje '6. Aplica acciones avanzadas solo despues de revisar el diagnostico y la bitacora.' -Nivel INFO
+    Write-Log -Mensaje '1. Usa Diagnostico Inteligente para obtener hallazgos priorizados y un reporte PDF.' -Nivel INFO
+    Write-Log -Mensaje '2. Usa Centro SAT / CFDI para distinguir equipo, CONTPAQi, PAC y servicios oficiales del SAT.' -Nivel INFO
+    Write-Log -Mensaje '3. Desde una terminal, valida primero servidor, puertos, firewall y carpetas compartidas.' -Nivel INFO
+    Write-Log -Mensaje '4. Usa Reparar Terminal solo si la validacion detecta problemas en la estacion.' -Nivel INFO
+    Write-Log -Mensaje '5. Usa Analisis del Servidor para localizarlo y obtener su inventario remoto.' -Nivel INFO
+    Write-Log -Mensaje '6. Para una base lenta o inestable, usa Mantenimiento SQL directamente en el servidor.' -Nivel INFO
+    Write-Log -Mensaje '7. Aplica acciones avanzadas solo despues de revisar el diagnostico y la bitacora.' -Nivel INFO
     Write-Host ''
     Write-Log -Mensaje 'Las acciones avanzadas solicitan confirmacion y muestran su validacion final.' -Nivel WARN
 }
@@ -8208,8 +8772,8 @@ function New-GUIButton {
     param(
         [string]$Text,
         [int]$W = 226, [int]$H = 34,
-        [System.Drawing.Color]$BgColor,
-        [System.Drawing.Color]$TextColor,
+        [System.Drawing.Color]$BgColor = $Script:GUIColors.Button,
+        [System.Drawing.Color]$TextColor = $Script:GUIColors.Text,
         [System.Drawing.Font]$Font,
         [scriptblock]$OnClick
     )
@@ -8231,7 +8795,7 @@ function New-GUILabel {
     param(
         [string]$Text,
         [int]$W = 238, [int]$H = 24,
-        [System.Drawing.Color]$TextColor,
+        [System.Drawing.Color]$TextColor = $Script:GUIColors.Text,
         [System.Drawing.Font]$Font,
         [string]$Align = 'MiddleLeft'
     )
@@ -8261,14 +8825,17 @@ function Build-GUIForm {
     Set-ModernFormStyle -Form $form
     $form.Text = "CONTPAQi TOOLBOX v$($Script:Version)"
     $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $initialWidth = [Math]::Min(1240, [Math]::Max(920, $workingArea.Width - 80))
-    $initialHeight = [Math]::Min(820, [Math]::Max(650, $workingArea.Height - 80))
+    $minimumWidth = [Math]::Min(860, [Math]::Max(640, $workingArea.Width - 20))
+    $minimumHeight = [Math]::Min(620, [Math]::Max(500, $workingArea.Height - 20))
+    $initialWidth = [Math]::Min(1240, [Math]::Max($minimumWidth, $workingArea.Width - 60))
+    $initialHeight = [Math]::Min(820, [Math]::Max($minimumHeight, $workingArea.Height - 60))
     $form.Size = New-Object System.Drawing.Size($initialWidth, $initialHeight)
-    $form.MinimumSize = New-Object System.Drawing.Size(920, 650)
+    $form.MinimumSize = New-Object System.Drawing.Size($minimumWidth, $minimumHeight)
     $form.StartPosition = 'CenterScreen'
     $form.BackColor = $Script:GUIColors.BG
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
     $form.ShowIcon = $true
+    $form.KeyPreview = $true
     $form.Add_FormClosing({
         param($sender, $e)
         if ($Script:IsBusy) {
@@ -8291,7 +8858,7 @@ function Build-GUIForm {
     $Script:HeaderTitle.Text = 'CONTPAQi  //  TOOLBOX'
     $Script:HeaderTitle.Location = New-Object System.Drawing.Point(92, 12)
     $Script:HeaderTitle.Size = New-Object System.Drawing.Size(620, 32)
-    $Script:HeaderTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20, [System.Drawing.FontStyle]::Bold)
+    $Script:HeaderTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 19, [System.Drawing.FontStyle]::Bold)
     $Script:HeaderTitle.ForeColor = $Script:GUIColors.Accent
     $Script:HeaderTitle.BackColor = [System.Drawing.Color]::Transparent
     $headerPanel.Controls.Add($Script:HeaderTitle)
@@ -8320,6 +8887,18 @@ function Build-GUIForm {
     $verLabel.Anchor = 'Top, Right'
     $headerPanel.Controls.Add($verLabel)
 
+    $headerTitleControl = $Script:HeaderTitle
+    $headerSubControl = $Script:HeaderSub
+    $resizeHeader = {
+        $ancho = [Math]::Max(0, $headerPanel.ClientSize.Width)
+        $verLabel.Left = [Math]::Max(94, $ancho - $verLabel.Width - 20)
+        $anchoTexto = [Math]::Max(140, $verLabel.Left - $headerTitleControl.Left - 14)
+        $headerTitleControl.Width = $anchoTexto
+        $headerSubControl.Width = $anchoTexto
+    }.GetNewClosure()
+    $headerPanel.Add_Resize($resizeHeader)
+    & $resizeHeader
+
     $headerAccent = New-Object System.Windows.Forms.Panel
     $headerAccent.Dock = 'Bottom'
     $headerAccent.Height = 2
@@ -8346,9 +8925,9 @@ function Build-GUIForm {
     # --- MAIN SPLIT PANEL ---
     $mainSplit = New-Object System.Windows.Forms.SplitContainer
     $mainSplit.Dock = 'Fill'
-    $mainSplit.SplitterDistance = 276
+    $mainSplit.SplitterDistance = [Math]::Min(276, [Math]::Max(238, [int]($initialWidth * 0.28)))
     $mainSplit.FixedPanel = 'Panel1'
-    $mainSplit.Panel1MinSize = 250
+    $mainSplit.Panel1MinSize = 230
     $mainSplit.BackColor = $Script:GUIColors.BG
     $mainSplit.SplitterWidth = 1
     $mainSplit.SplitterIncrement = 1
@@ -8368,6 +8947,7 @@ $sidebar.Padding = New-Object System.Windows.Forms.Padding(10, 8, 8, 12)
 $sidebar.HorizontalScroll.Enabled = $false
 $sidebar.HorizontalScroll.Visible = $false
 $sidebarOuter.Controls.Add($sidebar)
+$Script:Sidebar = $sidebar
 
     $sidebar.Add_Resize({
         param($sender, $eventArgs)
@@ -8386,19 +8966,15 @@ $sidebarOuter.Controls.Add($sidebar)
 
     $btnFont = New-Object System.Drawing.Font('Segoe UI', 9.2)
 
-    # --- ESCANEO PRIMERO: diagnosticar antes de modificar ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'ESCANEO Y BITACORAS'))
-
-    $sidebar.Controls.Add((New-GUIButton -Text '[8] Escaneo y Reparacion' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
-        Show-Accion -Titulo 'Escaneo y Reparacion' -Subtitulo 'Solo este equipo: detectar, reparar y verificar' -Color 'Green' -Accion { Invoke-EscaneoInteligenteCONTPAQi }
-    }))
+    # --- DIAGNOSTICO Y REPORTES ---
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'DIAGNOSTICO Y REPORTES'))
 
     $sidebar.Controls.Add((New-GUIButton -Text '[J] Diagnostico Inteligente + PDF' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Diagnostico Inteligente' -Subtitulo 'Analisis priorizado y reporte PDF profesional' -Color 'Magenta' -Accion { Invoke-DiagnosticoInteligenteCONTPAQi }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[C] Diagnostico de Red' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
-        Show-Accion -Titulo 'Diagnostico de Conectividad' -Subtitulo 'DNS + ruta + firewall + SQL + puertos CONTPAQi' -Color 'Cyan' -Accion { Show-DiagnosticoPuertosCONTPAQi }
+    $sidebar.Controls.Add((New-GUIButton -Text '[F] Centro SAT / CFDI' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+        Show-Accion -Titulo 'Centro SAT / CFDI' -Subtitulo 'Equipo vs CONTPAQi vs PAC vs SAT' -Color 'Magenta' -Accion { Show-DiagnosticoTimbrado }
     }))
 
     $sidebar.Controls.Add((New-GUIButton -Text '[L] Abrir Reportes' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
@@ -8419,16 +8995,12 @@ $sidebarOuter.Controls.Add($sidebar)
         Show-Accion -Titulo 'Estado Terminal' -Subtitulo 'AuthServer' -Color 'DarkCyan' -Accion { Show-EstadoServiciosTerminal }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[B] Iniciar Servicios' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Success -Font $btnFont -OnClick {
-        Show-Accion -Titulo 'Iniciar Detenidos' -Subtitulo 'Sin tocar activos' -Color 'Green' -Accion { Iniciar-ServiciosTerminalDetenidos }
-    }))
-
-    $sidebar.Controls.Add((New-GUIButton -Text '[A] Reiniciar Licencias' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Accent -Font $btnFont -OnClick {
-        Show-Accion -Titulo 'Reiniciar AuthServer' -Subtitulo 'Licencias' -Color 'Cyan' -Accion { Reiniciar-TodosServiciosTerminal }
+    $sidebar.Controls.Add((New-GUIButton -Text '[C] Validar Servidor y Accesos' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+        Show-Accion -Titulo 'Terminal hacia Servidor' -Subtitulo 'Puertos + firewall + carpetas + licencias' -Color 'DarkCyan' -Accion { Invoke-DiagnosticoTerminalServidorCONTPAQi }
     }))
 
     $sidebar.Controls.Add((New-GUIButton -Text '[H] Reparar Terminal' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Accent -Font $btnFont -OnClick {
-        Show-Accion -Titulo 'Reparacion de Terminal' -Subtitulo 'Servicios + temporales + red + validacion' -Color 'DarkCyan' -Accion { Reset-TerminalRapido }
+        Show-Accion -Titulo 'Reparacion Avanzada de Terminal' -Subtitulo 'Servicios + ACL + Windows + red + verificacion real' -Color 'DarkCyan' -Accion { Reset-TerminalRapido }
     }))
 
     # --- SERVIDOR ---
@@ -8454,10 +9026,6 @@ $sidebarOuter.Controls.Add($sidebar)
         Show-Accion -Titulo 'Reparacion Profunda' -Subtitulo 'Reinicio controlado y validacion completa' -Color 'Red' -Accion { Invoke-ReparacionProfundaCONTPAQi }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[1] Reiniciar Servidor y SQL' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
-        Show-Accion -Titulo 'Reiniciar Servicios y SQL' -Subtitulo 'CONTPAQi + Licencias + SQL Server' -Color 'Red' -Accion { Reiniciar-GrupoServicios -listaServicios ($ServiciosSACI + $ServiciosLicencias + (Get-ServiciosSQLRelacionados)) -nombreGrupo 'TODOS (CONTPAQi + SQL)' }
-    }))
-
     $sidebar.Controls.Add((New-GUIButton -Text '[5] Cerrar Sesiones CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Expulsar Usuarios' -Subtitulo 'Servidor RDS' -Color 'Red' -Accion { Expulsar-UsuariosSistemas }
     }))
@@ -8477,7 +9045,7 @@ $sidebarOuter.Controls.Add($sidebar)
     $sidebar.Controls.Add((New-GUISeccionLabel -Text 'ADMINISTRACION'))
 
     $sidebar.Controls.Add((New-GUIButton -Text '[7] Cambiar Contrasena SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font $btnFont -OnClick {
-        Show-Accion -Titulo 'Restablecer Contrasena SQL' -Subtitulo 'Login sa' -Color 'Green' -Accion { Restablecer-ContrasenaSQL }
+        Show-Accion -Titulo 'Cambiar Contrasena SQL' -Subtitulo 'Login sa' -Color 'Green' -Accion { Restablecer-ContrasenaSQL }
     }))
 
     $sidebar.Controls.Add((New-GUIButton -Text '[U] Desinstalar CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
@@ -8519,7 +9087,8 @@ $sidebarOuter.Controls.Add($sidebar)
 
     $form.Controls.SetChildIndex($mainSplit, 0)
     $form.PerformLayout()
-    $mainSplit.SplitterDistance = 276
+    $mainSplit.Panel2MinSize = 320
+    $mainSplit.SplitterDistance = [Math]::Min(276, [Math]::Max(238, [int]($form.ClientSize.Width * 0.28)))
 
     $Script:GUIForm = $form
     return $form
@@ -8533,8 +9102,6 @@ $Script:ConsoleMode = $false
 if (-not (Test-Admin)) {
     if (-not (Request-Administrator)) { exit 0 }
 }
-
-Initialize-ToolboxLog
 
 if (-not (Test-Admin)) {
     $msgForm = New-Object System.Windows.Forms.Form
@@ -8573,14 +9140,30 @@ if (-not (Test-Admin)) {
     exit 1
 }
 
-$form = Build-GUIForm
-
-if (-not (Show-Login)) { exit 1 }
-
-Write-BarraEstado
-Show-Bienvenida
-if ($Script:LogFile) {
-    Write-Log -Mensaje "Bitacora de esta sesion: $Script:LogFile" -Nivel INFO
+if (-not (Enter-ToolboxSingleInstance)) {
+    [System.Windows.Forms.MessageBox]::Show(
+        'CONTPAQi Toolbox ya esta abierto en este equipo.',
+        'CONTPAQi Toolbox', 'OK', 'Information'
+    ) | Out-Null
+    exit 0
 }
-$form.ShowDialog() | Out-Null
-exit 0
+
+Initialize-ToolboxLog
+$form = Build-GUIForm
+$codigoSalida = 0
+try {
+    if (-not (Show-Login)) {
+        $codigoSalida = 1
+    } else {
+        Write-BarraEstado
+        Show-Bienvenida
+        if ($Script:LogFile) {
+            Write-Log -Mensaje "Bitacora de esta sesion: $Script:LogFile" -Nivel INFO
+        }
+        $form.ShowDialog() | Out-Null
+    }
+} finally {
+    if ($form -and -not $form.IsDisposed) { $form.Dispose() }
+    Exit-ToolboxSingleInstance
+}
+exit $codigoSalida
