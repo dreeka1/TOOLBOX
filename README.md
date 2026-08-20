@@ -21,7 +21,7 @@ En soporte técnico es común saltar entre consolas, rutas, servicios y herramie
 - Preparado para distinguir funciones de servidor y terminal.
 - Diagnóstico terminal-servidor de puertos, firewall, SMB, rutas compartidas y licencias.
 - Integración opcional con Nmap y comprobación TCP nativa cuando no está instalado.
-- Diagnóstico inteligente con reporte PDF y análisis de salud SQL.
+- Diagnóstico inteligente con reporte PDF, datos de Excel y resumen de las 5 empresas SQL principales por espacio utilizado.
 - Reparaciones con confirmación escrita, actividad visible y validación final.
 - Monitor ServicesDev integrado en el mismo ejecutable portable.
 
@@ -42,6 +42,15 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 Para las funciones administrativas, abre PowerShell como administrador antes de iniciar el script.
+
+## Distribución v6.6
+
+La edición definitiva se entrega en dos formatos:
+
+- `TOOLBOXV6.6.exe`: ejecutable portable, sin instalación.
+- `CONTPAQi_Toolbox_Setup_v6.6.exe`: instalador para todos los usuarios, con accesos directos y desinstalador registrado en Windows.
+
+El instalador conserva los diagnósticos, logs y reportes cuando se desinstala la aplicación.
 
 ## Estructura del proyecto
 

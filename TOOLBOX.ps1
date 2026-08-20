@@ -5337,6 +5337,116 @@ Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='0ff1ce15-a989-4
     }
 }
 
+function Get-PrincipalesBasesDiagnosticoCONTPAQi {
+    param([AllowEmptyCollection()][string[]]$Instancias = @())
+
+    $resultados = New-Object System.Collections.Generic.List[object]
+    $consulta = @"
+SET NOCOUNT ON;
+CREATE TABLE #Espacio (
+    Nombre sysname NOT NULL,
+    DatosAsignadosMB decimal(19,2) NULL,
+    DatosUsadosMB decimal(19,2) NULL
+);
+DECLARE @db sysname, @sql nvarchar(max);
+DECLARE dbs CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE database_id > 4 AND state = 0 AND HAS_DBACCESS(name) = 1;
+OPEN dbs;
+FETCH NEXT FROM dbs INTO @db;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @sql = N'USE ' + QUOTENAME(@db) + N';
+            INSERT INTO #Espacio (Nombre, DatosAsignadosMB, DatosUsadosMB)
+            SELECT DB_NAME(),
+                   CAST(SUM(CASE WHEN type = 0 THEN size ELSE 0 END) * 8.0 / 1024 AS decimal(19,2)),
+                   CAST(SUM(CASE WHEN type = 0 THEN ISNULL(FILEPROPERTY(name, ''SpaceUsed''), 0) ELSE 0 END) * 8.0 / 1024 AS decimal(19,2))
+            FROM sys.database_files;';
+        EXEC sys.sp_executesql @sql;
+    END TRY
+    BEGIN CATCH
+    END CATCH;
+    FETCH NEXT FROM dbs INTO @db;
+END;
+CLOSE dbs;
+DEALLOCATE dbs;
+
+CREATE TABLE #LogSpace (Nombre sysname, LogSizeMB float, LogUsedPct float, Estado int);
+BEGIN TRY
+    INSERT INTO #LogSpace EXEC ('DBCC SQLPERF(LOGSPACE) WITH NO_INFOMSGS;');
+END TRY
+BEGIN CATCH
+END CATCH;
+
+CREATE TABLE #Respaldos (Nombre sysname PRIMARY KEY, UltimoRespaldo datetime NULL);
+BEGIN TRY
+    INSERT INTO #Respaldos (Nombre, UltimoRespaldo)
+    SELECT database_name, MAX(backup_finish_date)
+    FROM msdb.dbo.backupset
+    WHERE type = 'D'
+    GROUP BY database_name;
+END TRY
+BEGIN CATCH
+END CATCH;
+
+SELECT TOP (5)
+    d.name AS Nombre,
+    d.state_desc AS Estado,
+    CAST(ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) AS decimal(19,2)) AS DatosAsignadosMB,
+    CAST(ISNULL(e.DatosUsadosMB, 0) AS decimal(19,2)) AS DatosUsadosMB,
+    CAST(CASE WHEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) > ISNULL(e.DatosUsadosMB, 0)
+              THEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) - ISNULL(e.DatosUsadosMB, 0) ELSE 0 END AS decimal(19,2)) AS DatosLibresMB,
+    CAST(CASE WHEN ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) > 0
+              THEN ISNULL(e.DatosUsadosMB, 0) * 100.0 / ISNULL(e.DatosAsignadosMB, m.AsignadoMB) ELSE 0 END AS decimal(9,2)) AS UsoDatosPct,
+    CAST(ISNULL(l.LogSizeMB, 0) AS decimal(19,2)) AS LogMB,
+    CAST(ISNULL(l.LogUsedPct, 0) AS decimal(9,2)) AS LogUsadoPct,
+    r.UltimoRespaldo
+FROM sys.databases d
+LEFT JOIN #Espacio e ON e.Nombre = d.name
+LEFT JOIN #LogSpace l ON l.Nombre = d.name
+LEFT JOIN #Respaldos r ON r.Nombre = d.name
+OUTER APPLY (
+    SELECT SUM(CASE WHEN type = 0 THEN size ELSE 0 END) * 8.0 / 1024 AS AsignadoMB
+    FROM sys.master_files
+    WHERE database_id = d.database_id
+) m
+WHERE d.database_id > 4
+  AND NOT (d.name LIKE 'document[_]%' AND (d.name LIKE '%[_]content' OR d.name LIKE '%[_]metadata'))
+  AND d.name NOT IN ('ADD_Catalogos','CompacWAdmin','GeneralSQL','dbDocumentosDigitales','CONTPAQ_I_SDK')
+ORDER BY ISNULL(e.DatosUsadosMB, 0) DESC,
+         ISNULL(e.DatosAsignadosMB, ISNULL(m.AsignadoMB, 0)) DESC,
+         d.name;
+"@
+
+    foreach ($instancia in @($Instancias | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        $resultado = Invoke-SqlTableResponsive -Instancia $instancia -Consulta $consulta -TimeoutSegundos 55 -Actividad "Leyendo empresas principales de $instancia"
+        if (-not $resultado.Correcto) {
+            Write-Log -Mensaje "No fue posible obtener empresas de $($instancia): $($resultado.Error)" -Nivel WARN
+            continue
+        }
+        foreach ($fila in @($resultado.Filas)) {
+            $respaldo = $null
+            if ($null -ne $fila.UltimoRespaldo -and $fila.UltimoRespaldo -isnot [DBNull]) {
+                try { $respaldo = [datetime]$fila.UltimoRespaldo } catch { $respaldo = $null }
+            }
+            [void]$resultados.Add([PSCustomObject]@{
+                Instancia = $instancia
+                Nombre = [string]$fila.Nombre
+                Estado = [string]$fila.Estado
+                DatosAsignadosMB = [math]::Round([double]$fila.DatosAsignadosMB, 2)
+                DatosUsadosMB = [math]::Round([double]$fila.DatosUsadosMB, 2)
+                DatosLibresMB = [math]::Round([double]$fila.DatosLibresMB, 2)
+                UsoDatosPct = [math]::Round([double]$fila.UsoDatosPct, 1)
+                LogMB = [math]::Round([double]$fila.LogMB, 2)
+                LogUsadoPct = [math]::Round([double]$fila.LogUsadoPct, 1)
+                UltimoRespaldo = $respaldo
+            })
+        }
+    }
+    return @($resultados | Sort-Object DatosUsadosMB, DatosAsignadosMB -Descending | Select-Object -First 5)
+}
+
 function Get-DiagnosticoInteligenteCONTPAQi {
     $inicio = Get-Date
     $hallazgos = New-Object System.Collections.ArrayList
@@ -5473,6 +5583,13 @@ function Get-DiagnosticoInteligenteCONTPAQi {
         }
     }
     $inventario.SQL = @($sqlResultados)
+    $instanciasDisponibles = @($sqlResultados | Where-Object { $_.Estado -eq 'Disponible' } | ForEach-Object { [string]$_.Instancia })
+    $inventario.EmpresasPrincipales = @(Get-PrincipalesBasesDiagnosticoCONTPAQi -Instancias $instanciasDisponibles)
+    if ($inventario.EmpresasPrincipales.Count -gt 0) {
+        Write-Log -Mensaje "Empresas principales incluidas en el reporte: $($inventario.EmpresasPrincipales.Count)." -Nivel OK
+    } elseif ($instanciasDisponibles.Count -gt 0) {
+        Write-Log -Mensaje 'SQL esta disponible, pero no fue posible obtener empresas principales con los permisos actuales.' -Nivel WARN
+    }
 
     Write-Log -Mensaje '[6/9] Midiendo almacenamiento...' -Nivel PROGRESS
     $discos = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object {
@@ -5626,19 +5743,36 @@ function Export-DiagnosticoInteligentePdfCONTPAQi {
         "<tr><td>$($_.Fecha.ToString('dd/MM/yyyy HH:mm'))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Origen))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Id))</td><td>$((ConvertTo-HtmlSeguroCONTPAQi $_.Mensaje))</td></tr>"
     })) -join ''
     if (-not $eventosHtml) { $eventosHtml = "<tr><td colspan='4' class='ok-text'>Sin eventos relacionados en el periodo revisado.</td></tr>" }
+    $empresasPrincipales = @($Diagnostico.Inventario.EmpresasPrincipales | Select-Object -First 5)
+    $empresasHtml = (@($empresasPrincipales | ForEach-Object {
+        $estadoClase = if ($_.Estado -eq 'ONLINE') { 'ok-text' } else { 'bad-text' }
+        $usoClase = if ([double]$_.UsoDatosPct -ge 90) { 'bad-text' } elseif ([double]$_.UsoDatosPct -ge 80) { 'warning-text' } else { 'ok-text' }
+        $usoBarra = [math]::Max(0, [math]::Min(100, [int][math]::Round([double]$_.UsoDatosPct)))
+        $respaldoTexto = if ($_.UltimoRespaldo) { ([datetime]$_.UltimoRespaldo).ToString('dd/MM/yyyy HH:mm') } else { 'Sin registro o sin permiso' }
+        $usadoGB = [math]::Round([double]$_.DatosUsadosMB / 1024, 2)
+        $asignadoGB = [math]::Round([double]$_.DatosAsignadosMB / 1024, 2)
+        $libreGB = [math]::Round([double]$_.DatosLibresMB / 1024, 2)
+        $logGB = [math]::Round([double]$_.LogMB / 1024, 2)
+        "<tr class='company-row'><td><b class='company-name'>$((ConvertTo-HtmlSeguroCONTPAQi $_.Nombre))</b><small class='company-meta'>Instancia: $((ConvertTo-HtmlSeguroCONTPAQi $_.Instancia))</small></td><td class='$estadoClase'>$((ConvertTo-HtmlSeguroCONTPAQi $_.Estado))</td><td><b>$usadoGB GB</b><small class='company-meta'>de $asignadoGB GB | Log $logGB GB ($($_.LogUsadoPct)%)</small></td><td>$libreGB GB</td><td><b class='$usoClase'>$($_.UsoDatosPct)%</b><div class='mini-bar'><i class='$usoClase' style='width:$usoBarra%'></i></div></td><td>$((ConvertTo-HtmlSeguroCONTPAQi $respaldoTexto))</td></tr>"
+    })) -join ''
+    if (-not $empresasHtml) {
+        $empresasHtml = "<tr><td colspan='6'>No se obtuvo informacion de empresas. Ejecuta el diagnostico en el servidor SQL con un usuario de Windows que tenga acceso a las bases.</td></tr>"
+    }
     $criticas = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'CRITICA').Count
     $altas = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'ALTA').Count
     $medias = @($Diagnostico.Hallazgos | Where-Object Severidad -eq 'MEDIA').Count
     $html = @"
 <!doctype html><html lang='es'><head><meta charset='utf-8'><title>Diagnostico CONTPAQi</title><style>
-@page{size:A4;margin:13mm;background:#07070b}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#07070b;color:#e8eaf2;font:12px 'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{min-height:260mm}.header{display:flex;align-items:center;padding:18px 20px;background:linear-gradient(135deg,#0d0d14,#171126);border:1px solid #2a2040;border-bottom:3px solid #7c3aed}.logo{width:54px;height:54px;object-fit:contain;margin-right:16px}.brand h1{font-size:23px;margin:0;color:#a78bfa;letter-spacing:.3px}.brand p{margin:4px 0 0;color:#8990a3}.version{margin-left:auto;color:#a78bfa;background:#211634;padding:7px 11px}.summary{display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;gap:10px;margin:13px 0}.card{background:#111119;border:1px solid #272735;padding:13px;min-height:76px}.label{font-size:9px;font-weight:700;color:#9298aa;letter-spacing:.8px}.value{font-size:20px;font-weight:800;margin-top:7px;color:#f3f4f6}.purple{color:#9b6cff}.red{color:#ff5d73}.amber{color:#ffbf47}.green{color:#38e08f}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:#0e0e15;border:1px solid #252533;padding:12px;margin-bottom:14px}.meta div{color:#a7adbd}.meta b{color:#e8eaf2}.section-title{margin:18px 0 9px;padding:8px 10px;color:#a78bfa;background:#141020;border-left:4px solid #7c3aed;font-size:13px;letter-spacing:.4px;break-after:avoid}.finding{background:#101017;border:1px solid #272733;border-left:4px solid #6b7280;margin:0 0 9px;padding:11px 12px;break-inside:avoid}.finding.critical{border-left-color:#ff5d73}.finding.high{border-left-color:#ff8a5b}.finding.medium{border-left-color:#ffbf47}.finding.info,.finding.healthy{border-left-color:#38e08f}.finding-head{display:flex;gap:8px;align-items:center}.pill{font-size:8px;font-weight:800;padding:3px 7px;background:#2a2139;color:#c4b5fd}.category{font-size:9px;color:#9298aa}.finding-title{font-size:14px;font-weight:750;margin:7px 0 8px}.finding-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.finding-grid>div{border-top:1px solid #292938;padding-top:7px}.finding-grid b{font-size:8px;color:#a78bfa}.finding-grid p{margin:4px 0 0;color:#c9cdd8;line-height:1.35}.office{background:#101017;border:1px solid #302841;margin:0 0 10px;break-inside:avoid}.office-title{padding:7px 10px;background:#181522;color:#a78bfa;font-size:9px;font-weight:800;letter-spacing:.5px}.office-grid{display:grid;grid-template-columns:1.35fr .75fr .75fr .9fr 1.15fr}.office-grid>div{padding:9px;border-right:1px solid #292938;min-width:0}.office-grid>div:last-child{border-right:0}.office-grid span{display:block;color:#858b9d;font-size:7px;font-weight:800;margin-bottom:4px}.office-grid b{display:block;font-size:9px;line-height:1.25;overflow-wrap:anywhere}.office-grid small{display:block;font-size:7px;margin-top:3px}.warning-text{color:#ffbf47}.two-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{background:#101017;border:1px solid #272733;padding:10px;break-inside:avoid}.panel h3{font-size:10px;color:#a78bfa;margin:0 0 7px}.panel ul{margin:0;padding-left:16px;font-size:9.5px;line-height:1.2}.panel li{margin:1px 0}.disk{margin:0 0 9px}.disk-row{display:flex;justify-content:space-between;margin-bottom:4px}.bar{height:7px;background:#292938}.bar i{display:block;height:100%;background:linear-gradient(90deg,#6d28d9,#a78bfa)}small{color:#858b9d}table{width:100%;border-collapse:collapse;background:#101017;font-size:9px}th{color:#a78bfa;background:#181522;text-align:left}th,td{border:1px solid #292938;padding:6px;vertical-align:top}td{color:#c9cdd8}.ok-text{color:#38e08f}.bad-text{color:#ff5d73}.footer{margin-top:16px;padding-top:9px;border-top:1px solid #2a2040;color:#858b9d;font-size:9px;text-align:center}.note{background:#151122;border:1px solid #302346;padding:10px;color:#b9becb;line-height:1.4} @media print{html,body{background:#07070b}.page{min-height:auto}}
+@page{size:A4;margin:13mm;background:#07070b}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#07070b;color:#e8eaf2;font:12px 'Segoe UI',Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{min-height:260mm}.header{display:flex;align-items:center;padding:18px 20px;background:linear-gradient(135deg,#0d0d14,#171126);border:1px solid #2a2040;border-bottom:3px solid #7c3aed}.logo{width:54px;height:54px;object-fit:contain;margin-right:16px}.brand h1{font-size:23px;margin:0;color:#a78bfa;letter-spacing:.3px}.brand p{margin:4px 0 0;color:#8990a3}.version{margin-left:auto;color:#a78bfa;background:#211634;padding:7px 11px}.summary{display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;gap:10px;margin:13px 0}.card{background:#111119;border:1px solid #272735;padding:13px;min-height:76px}.label{font-size:9px;font-weight:700;color:#9298aa;letter-spacing:.8px}.value{font-size:20px;font-weight:800;margin-top:7px;color:#f3f4f6}.purple{color:#9b6cff}.red{color:#ff5d73}.amber{color:#ffbf47}.green{color:#38e08f}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;background:#0e0e15;border:1px solid #252533;padding:12px;margin-bottom:14px}.meta div{color:#a7adbd}.meta b{color:#e8eaf2}.section-title{margin:18px 0 9px;padding:8px 10px;color:#a78bfa;background:#141020;border-left:4px solid #7c3aed;font-size:13px;letter-spacing:.4px;break-after:avoid}.finding{background:#101017;border:1px solid #272733;border-left:4px solid #6b7280;margin:0 0 9px;padding:11px 12px;break-inside:avoid}.finding.critical{border-left-color:#ff5d73}.finding.high{border-left-color:#ff8a5b}.finding.medium{border-left-color:#ffbf47}.finding.info,.finding.healthy{border-left-color:#38e08f}.finding-head{display:flex;gap:8px;align-items:center}.pill{font-size:8px;font-weight:800;padding:3px 7px;background:#2a2139;color:#c4b5fd}.category{font-size:9px;color:#9298aa}.finding-title{font-size:14px;font-weight:750;margin:7px 0 8px}.finding-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.finding-grid>div{border-top:1px solid #292938;padding-top:7px}.finding-grid b{font-size:8px;color:#a78bfa}.finding-grid p{margin:4px 0 0;color:#c9cdd8;line-height:1.35}.office{background:#101017;border:1px solid #302841;margin:0 0 10px;break-inside:avoid}.office-title{padding:7px 10px;background:#181522;color:#a78bfa;font-size:9px;font-weight:800;letter-spacing:.5px}.office-grid{display:grid;grid-template-columns:1.35fr .75fr .75fr .9fr 1.15fr}.office-grid>div{padding:9px;border-right:1px solid #292938;min-width:0}.office-grid>div:last-child{border-right:0}.office-grid span{display:block;color:#858b9d;font-size:7px;font-weight:800;margin-bottom:4px}.office-grid b{display:block;font-size:9px;line-height:1.25;overflow-wrap:anywhere}.office-grid small{display:block;font-size:7px;margin-top:3px}.warning-text{color:#ffbf47}.two-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.panel{background:#101017;border:1px solid #272733;padding:10px;break-inside:avoid}.panel h3{font-size:10px;color:#a78bfa;margin:0 0 7px}.panel ul{margin:0;padding-left:16px;font-size:9.5px;line-height:1.2}.panel li{margin:1px 0}.disk{margin:0 0 9px}.disk-row{display:flex;justify-content:space-between;margin-bottom:4px}.bar{height:7px;background:#292938}.bar i{display:block;height:100%;background:linear-gradient(90deg,#6d28d9,#a78bfa)}small{color:#858b9d}table{width:100%;border-collapse:collapse;background:#101017;font-size:9px}th{color:#a78bfa;background:#181522;text-align:left}th,td{border:1px solid #292938;padding:6px;vertical-align:top}td{color:#c9cdd8}.company-table{table-layout:fixed;font-size:7.8px}.company-table th,.company-table td{padding:4px;overflow-wrap:anywhere}.company-table th:nth-child(1){width:24%}.company-table th:nth-child(2){width:14%}.company-table th:nth-child(3){width:18%}.company-table th:nth-child(4){width:10%}.company-table th:nth-child(5){width:11%}.company-table th:nth-child(6){width:23%}.company-row{break-inside:avoid}.company-name{display:block;color:#e8eaf2;overflow-wrap:anywhere}.company-meta{display:block;margin-top:2px;font-size:6.5px;color:#858b9d;overflow-wrap:anywhere}.mini-bar{height:4px;margin-top:3px;background:#292938}.mini-bar i{display:block;height:100%;background:#38e08f}.mini-bar i.warning-text{background:#ffbf47}.mini-bar i.bad-text{background:#ff5d73}.ok-text{color:#38e08f}.bad-text{color:#ff5d73}.footer{margin-top:16px;padding-top:9px;border-top:1px solid #2a2040;color:#858b9d;font-size:9px;text-align:center}.note{background:#151122;border:1px solid #302346;padding:10px;color:#b9becb;line-height:1.4} @media print{html,body{background:#07070b}.page{min-height:auto}}
 </style></head><body><main class='page'>
 <header class='header'>$logoHtml<div class='brand'><h1>DIAGNOSTICO INTELIGENTE</h1><p>CONTPAQi Toolbox - Evaluacion tecnica de solo lectura</p></div><div class='version'>v$($Script:Version)</div></header>
 <section class='summary'><div class='card'><div class='label'>PUNTAJE GENERAL</div><div class='value purple'>$($Diagnostico.Puntaje) / 100</div></div><div class='card'><div class='label'>ESTADO</div><div class='value'>$((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Estado))</div></div><div class='card'><div class='label'>CRITICAS / ALTAS</div><div class='value red'>$criticas / $altas</div></div><div class='card'><div class='label'>ADVERTENCIAS</div><div class='value amber'>$medias</div></div></section>
 <section class='meta'><div><b>Equipo:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Equipo))</div><div><b>Perfil:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Perfil))</div><div><b>Generado:</b> $($Diagnostico.Generado.ToString('dd/MM/yyyy HH:mm:ss'))</div><div><b>Duracion:</b> $($Diagnostico.DuracionSegundos) segundos</div><div><b>Sistema:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Inventario.Sistema))</div><div><b>Reinicio pendiente:</b> $((ConvertTo-HtmlSeguroCONTPAQi $Diagnostico.Inventario.ReinicioPendiente))</div></section>
 <h2 class='section-title'>HALLAZGOS Y RECOMENDACIONES</h2>$hallazgosHtml
 <h2 class='section-title'>SERVICIOS RELACIONADOS</h2><table><thead><tr><th>Servicio</th><th>Descripcion</th><th>Estado</th><th>Inicio</th></tr></thead><tbody>$serviciosHtml</tbody></table>
-<h2 class='section-title'>INVENTARIO DEL EQUIPO</h2>$excelHtml<section class='two-cols'><div class='panel'><h3>PRODUCTOS DETECTADOS</h3><ul>$productosHtml</ul></div><div class='panel'><h3>ALMACENAMIENTO</h3>$discosHtml</div></section>
+<h2 class='section-title'>INVENTARIO DEL EQUIPO</h2>$excelHtml
+<h2 class='section-title'>5 EMPRESAS PRINCIPALES POR ESPACIO UTILIZADO</h2><div class='note'>Se muestran bases principales de usuario; las bases auxiliares de contenido, metadata y catalogos tecnicos no se cuentan como empresas.</div><table class='company-table'><thead><tr><th>Empresa / instancia</th><th>Estado</th><th>Datos y log</th><th>Disponible</th><th>Uso</th><th>Ultimo respaldo</th></tr></thead><tbody>$empresasHtml</tbody></table>
+<section class='two-cols'><div class='panel'><h3>PRODUCTOS DETECTADOS</h3><ul>$productosHtml</ul></div><div class='panel'><h3>ALMACENAMIENTO</h3>$discosHtml</div></section>
 <h2 class='section-title'>EVENTOS RECIENTES</h2><table><thead><tr><th>Fecha</th><th>Origen</th><th>ID</th><th>Detalle</th></tr></thead><tbody>$eventosHtml</tbody></table>
 <h2 class='section-title'>INTERPRETACION</h2><div class='note'>Este reporte recopila evidencia sin modificar configuraciones. Las acciones son recomendaciones tecnicas y deben validarse de acuerdo con el rol del equipo, respaldos disponibles y ventana de mantenimiento. Despues de cualquier correccion, genera un nuevo diagnostico y realiza una prueba funcional dentro de CONTPAQi.</div>
 <footer class='footer'>CONTPAQi Toolbox v$($Script:Version) | $($Script:MarcaAgua) | Reporte $baseNombre</footer>
