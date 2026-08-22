@@ -20,7 +20,7 @@ if ($consoleWnd -ne [IntPtr]::Zero) {
     [Win32]::ShowWindow($consoleWnd, 0)
 }
 
-$Script:Version          = '6.6'
+$Script:Version          = '6.6.1'
 $Script:MarcaAgua        = 'Desarrollado por Derek Salinas'
 $Script:ColorTitulo      = 'Cyan'
 $Script:ColorAcento      = 'White'
@@ -329,26 +329,26 @@ try {
 
 # --- COLORES GUI ---
 $Script:GUIColors = @{
-    BG           = [System.Drawing.Color]::FromArgb(5, 6, 8)
-    Sidebar      = [System.Drawing.Color]::FromArgb(9, 11, 15)
-    Header       = [System.Drawing.Color]::FromArgb(7, 9, 12)
-    Surface      = [System.Drawing.Color]::FromArgb(13, 16, 21)
-    SurfaceAlt   = [System.Drawing.Color]::FromArgb(16, 20, 26)
-    Button       = [System.Drawing.Color]::FromArgb(17, 21, 27)
-    ButtonHover  = [System.Drawing.Color]::FromArgb(24, 32, 42)
-    ButtonActive = [System.Drawing.Color]::FromArgb(32, 42, 54)
+    BG           = [System.Drawing.Color]::FromArgb(7, 8, 12)
+    Sidebar      = [System.Drawing.Color]::FromArgb(10, 12, 17)
+    Header       = [System.Drawing.Color]::FromArgb(7, 8, 12)
+    Surface      = [System.Drawing.Color]::FromArgb(17, 19, 27)
+    SurfaceAlt   = [System.Drawing.Color]::FromArgb(24, 27, 38)
+    Button       = [System.Drawing.Color]::FromArgb(18, 21, 29)
+    ButtonHover  = [System.Drawing.Color]::FromArgb(30, 33, 45)
+    ButtonActive = [System.Drawing.Color]::FromArgb(40, 35, 60)
     Text         = [System.Drawing.Color]::FromArgb(241, 245, 249)
-    TextDim      = [System.Drawing.Color]::FromArgb(124, 135, 152)
-    Accent       = [System.Drawing.Color]::FromArgb(139, 92, 246)
-    AccentDark   = [System.Drawing.Color]::FromArgb(50, 25, 87)
-    Success      = [System.Drawing.Color]::FromArgb(56, 224, 143)
-    Warning      = [System.Drawing.Color]::FromArgb(255, 191, 71)
-    Error        = [System.Drawing.Color]::FromArgb(255, 93, 115)
-    LogBG        = [System.Drawing.Color]::FromArgb(2, 3, 4)
-    Separator    = [System.Drawing.Color]::FromArgb(26, 32, 41)
-    ServerBtn    = [System.Drawing.Color]::FromArgb(27, 12, 17)
-    TerminalBtn  = [System.Drawing.Color]::FromArgb(8, 22, 29)
-    SupportBtn   = [System.Drawing.Color]::FromArgb(13, 19, 25)
+    TextDim      = [System.Drawing.Color]::FromArgb(139, 148, 165)
+    Accent       = [System.Drawing.Color]::FromArgb(151, 112, 255)
+    AccentDark   = [System.Drawing.Color]::FromArgb(64, 42, 112)
+    Success      = [System.Drawing.Color]::FromArgb(60, 218, 151)
+    Warning      = [System.Drawing.Color]::FromArgb(255, 190, 82)
+    Error        = [System.Drawing.Color]::FromArgb(255, 96, 120)
+    LogBG        = [System.Drawing.Color]::FromArgb(4, 5, 8)
+    Separator    = [System.Drawing.Color]::FromArgb(31, 34, 44)
+    ServerBtn    = [System.Drawing.Color]::FromArgb(34, 18, 24)
+    TerminalBtn  = [System.Drawing.Color]::FromArgb(14, 27, 31)
+    SupportBtn   = [System.Drawing.Color]::FromArgb(23, 20, 34)
 }
 
 Add-Type -TypeDefinition @"
@@ -1323,7 +1323,7 @@ function Show-Login {
     $loginForm = New-Object System.Windows.Forms.Form
     Set-ModernFormStyle -Form $loginForm
     $loginForm.Text = 'CONTPAQi Toolbox - Acceso'
-    $loginForm.Size = New-Object System.Drawing.Size(480, 440)
+    $loginForm.ClientSize = New-Object System.Drawing.Size(820, 450)
     $loginForm.StartPosition = 'CenterScreen'
     $loginForm.FormBorderStyle = 'FixedDialog'
     $loginForm.MaximizeBox = $false
@@ -1332,56 +1332,76 @@ function Show-Login {
     $loginForm.TopMost = $true
     $loginForm.KeyPreview = $true
 
+    $bannerImage = $null
+    $bannerPath = Get-ToolboxAssetPath -FileName 'DSBANER.png'
+    $bannerPicture = New-Object System.Windows.Forms.PictureBox
+    $bannerPicture.Dock = 'Fill'
+    $bannerPicture.BackColor = $Script:GUIColors.BG
+    $bannerPicture.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+    if ($bannerPath) {
+        try {
+            $sourceBanner = [System.Drawing.Image]::FromFile($bannerPath)
+            try { $bannerImage = New-Object System.Drawing.Bitmap($sourceBanner) } finally { $sourceBanner.Dispose() }
+            $bannerPicture.Image = $bannerImage
+        } catch { $bannerImage = $null }
+    }
+    $loginForm.Controls.Add($bannerPicture)
+
     $titleLabel = New-Object System.Windows.Forms.Label
     $titleLabel.Text = 'CONTPAQi TOOLBOX'
-    $titleLabel.Location = New-Object System.Drawing.Point(105, 25)
-    $titleLabel.Size = New-Object System.Drawing.Size(340, 38)
-    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.Location = New-Object System.Drawing.Point(25, 20)
+    $titleLabel.Size = New-Object System.Drawing.Size(310, 34)
+    $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 17, [System.Drawing.FontStyle]::Bold)
     $titleLabel.ForeColor = $Script:GUIColors.Accent
     $titleLabel.TextAlign = 'MiddleLeft'
-    $loginForm.Controls.Add($titleLabel)
 
     $subLabel = New-Object System.Windows.Forms.Label
-    $subLabel.Text = 'Acceso restringido - Solo personal autorizado'
-    $subLabel.Location = New-Object System.Drawing.Point(108, 66)
-    $subLabel.Size = New-Object System.Drawing.Size(335, 20)
+    $subLabel.Text = 'Acceso seguro para personal autorizado'
+    $subLabel.Location = New-Object System.Drawing.Point(28, 58)
+    $subLabel.Size = New-Object System.Drawing.Size(305, 20)
     $subLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $subLabel.ForeColor = $Script:GUIColors.TextDim
     $subLabel.TextAlign = 'MiddleLeft'
-    $loginForm.Controls.Add($subLabel)
-
-    $loginAccent = New-Object System.Windows.Forms.Panel
-    $loginAccent.Dock = 'Top'
-    $loginAccent.Height = 3
-    $loginAccent.BackColor = $Script:GUIColors.Accent
-    $loginForm.Controls.Add($loginAccent)
-
-    $loginLogo = New-ToolboxLogoPictureBox -Size 68
-    $loginLogo.Location = New-Object System.Drawing.Point(28, 18)
-    $loginForm.Controls.Add($loginLogo)
 
     $loginCard = New-Object System.Windows.Forms.Panel
-    $loginCard.Location = New-Object System.Drawing.Point(38, 105)
-    $loginCard.Size = New-Object System.Drawing.Size(390, 260)
+    $loginCard.Location = New-Object System.Drawing.Point(30, 35)
+    $loginCard.Size = New-Object System.Drawing.Size(360, 380)
     $loginCard.BackColor = $Script:GUIColors.Surface
     $loginCard.Add_Paint({
         param($sender, $eventArgs)
-        $pen = New-Object System.Drawing.Pen($Script:GUIColors.Separator)
+        $pen = New-Object System.Drawing.Pen($Script:GUIColors.AccentDark)
         try { $eventArgs.Graphics.DrawRectangle($pen, 0, 0, $sender.Width - 1, $sender.Height - 1) } finally { $pen.Dispose() }
     })
     $loginForm.Controls.Add($loginCard)
+    $bannerPicture.SendToBack()
+    $loginCard.BringToFront()
+    $loginForm.Add_Shown({ $loginCard.BringToFront() }.GetNewClosure())
+    $loginCard.Controls.Add($titleLabel)
+    $loginCard.Controls.Add($subLabel)
+
+    $cardAccent = New-Object System.Windows.Forms.Panel
+    $cardAccent.Dock = 'Left'
+    $cardAccent.Width = 4
+    $cardAccent.BackColor = $Script:GUIColors.Accent
+    $loginCard.Controls.Add($cardAccent)
+
+    $cardSeparator = New-Object System.Windows.Forms.Panel
+    $cardSeparator.Location = New-Object System.Drawing.Point(28, 92)
+    $cardSeparator.Size = New-Object System.Drawing.Size(304, 1)
+    $cardSeparator.BackColor = $Script:GUIColors.Separator
+    $loginCard.Controls.Add($cardSeparator)
 
     $userLabel = New-Object System.Windows.Forms.Label
     $userLabel.Text = 'Usuario:'
-    $userLabel.Location = New-Object System.Drawing.Point(24, 18)
+    $userLabel.Location = New-Object System.Drawing.Point(28, 110)
     $userLabel.Size = New-Object System.Drawing.Size(100, 22)
     $userLabel.ForeColor = $Script:GUIColors.Text
     $userLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $loginCard.Controls.Add($userLabel)
 
     $userBox = New-Object System.Windows.Forms.TextBox
-    $userBox.Location = New-Object System.Drawing.Point(24, 44)
-    $userBox.Size = New-Object System.Drawing.Size(342, 29)
+    $userBox.Location = New-Object System.Drawing.Point(28, 136)
+    $userBox.Size = New-Object System.Drawing.Size(304, 29)
     $userBox.Font = New-Object System.Drawing.Font('Segoe UI', 11)
     $userBox.BackColor = $Script:GUIColors.LogBG
     $userBox.ForeColor = $Script:GUIColors.Text
@@ -1389,16 +1409,16 @@ function Show-Login {
     $loginCard.Controls.Add($userBox)
 
     $passLabel = New-Object System.Windows.Forms.Label
-    $passLabel.Text = 'Contrasena:'
-    $passLabel.Location = New-Object System.Drawing.Point(24, 91)
+    $passLabel.Text = 'Contraseña:'
+    $passLabel.Location = New-Object System.Drawing.Point(28, 184)
     $passLabel.Size = New-Object System.Drawing.Size(100, 22)
     $passLabel.ForeColor = $Script:GUIColors.Text
     $passLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $loginCard.Controls.Add($passLabel)
 
     $passBox = New-Object System.Windows.Forms.TextBox
-    $passBox.Location = New-Object System.Drawing.Point(24, 117)
-    $passBox.Size = New-Object System.Drawing.Size(342, 29)
+    $passBox.Location = New-Object System.Drawing.Point(28, 210)
+    $passBox.Size = New-Object System.Drawing.Size(304, 29)
     $passBox.Font = New-Object System.Drawing.Font('Segoe UI', 11)
     $passBox.BackColor = $Script:GUIColors.LogBG
     $passBox.ForeColor = $Script:GUIColors.Text
@@ -1408,8 +1428,8 @@ function Show-Login {
 
     $loginBtn = New-Object System.Windows.Forms.Button
     $loginBtn.Text = 'Ingresar'
-    $loginBtn.Location = New-Object System.Drawing.Point(24, 181)
-    $loginBtn.Size = New-Object System.Drawing.Size(162, 42)
+    $loginBtn.Location = New-Object System.Drawing.Point(28, 274)
+    $loginBtn.Size = New-Object System.Drawing.Size(145, 42)
     $loginBtn.BackColor = $Script:GUIColors.Accent
     $loginBtn.ForeColor = $Script:GUIColors.BG
     $loginBtn.FlatStyle = 'Flat'
@@ -1421,8 +1441,8 @@ function Show-Login {
 
     $cancelBtn = New-Object System.Windows.Forms.Button
     $cancelBtn.Text = 'Cancelar'
-    $cancelBtn.Location = New-Object System.Drawing.Point(204, 181)
-    $cancelBtn.Size = New-Object System.Drawing.Size(162, 42)
+    $cancelBtn.Location = New-Object System.Drawing.Point(187, 274)
+    $cancelBtn.Size = New-Object System.Drawing.Size(145, 42)
     $cancelBtn.BackColor = $Script:GUIColors.Button
     $cancelBtn.ForeColor = $Script:GUIColors.Text
     $cancelBtn.FlatStyle = 'Flat'
@@ -1431,6 +1451,15 @@ function Show-Login {
     Set-ModernButtonStyle -Button $cancelBtn
     $cancelBtn.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $loginCard.Controls.Add($cancelBtn)
+
+    $loginHint = New-Object System.Windows.Forms.Label
+    $loginHint.Text = 'Tus credenciales se validan localmente.'
+    $loginHint.Location = New-Object System.Drawing.Point(28, 337)
+    $loginHint.Size = New-Object System.Drawing.Size(304, 20)
+    $loginHint.TextAlign = 'MiddleCenter'
+    $loginHint.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $loginHint.ForeColor = $Script:GUIColors.TextDim
+    $loginCard.Controls.Add($loginHint)
 
     $loginForm.AcceptButton = $loginBtn
     $loginForm.CancelButton = $cancelBtn
@@ -1471,6 +1500,7 @@ function Show-Login {
     } finally {
         $passBox.Clear()
         $loginForm.Dispose()
+        if ($bannerImage) { $bannerImage.Dispose() }
     }
 }
 
@@ -8771,7 +8801,7 @@ function Show-Bienvenida {
 function New-GUIButton {
     param(
         [string]$Text,
-        [int]$W = 226, [int]$H = 34,
+        [int]$W = 226, [int]$H = 40,
         [System.Drawing.Color]$BgColor = $Script:GUIColors.Button,
         [System.Drawing.Color]$TextColor = $Script:GUIColors.Text,
         [System.Drawing.Font]$Font,
@@ -8785,8 +8815,8 @@ function New-GUIButton {
     Set-ModernButtonStyle -Button $btn -BaseColor $BgColor -TextColor $TextColor
     if ($Font) { $btn.Font = $Font } else { $btn.Font = New-Object System.Drawing.Font('Segoe UI', 9) }
     $btn.TextAlign = 'MiddleLeft'
-    $btn.Padding = New-Object System.Windows.Forms.Padding(12, 0, 8, 0)
-    $btn.Margin = New-Object System.Windows.Forms.Padding(6, 2, 6, 2)
+    $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, 8, 0)
+    $btn.Margin = New-Object System.Windows.Forms.Padding(6, 3, 6, 3)
     $btn.Add_Click($OnClick)
     return $btn
 }
@@ -8814,10 +8844,188 @@ function New-GUILabel {
 
 function New-GUISeccionLabel {
     param([string]$Text)
-    $lbl = New-GUILabel -Text ("  " + $Text) -W 226 -H 30 -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 8.5, [System.Drawing.FontStyle]::Bold))
-    $lbl.BackColor = $Script:GUIColors.Surface
-    $lbl.Margin = New-Object System.Windows.Forms.Padding(6, 14, 6, 4)
+    $lbl = New-GUILabel -Text ($Text.ToUpperInvariant()) -W 226 -H 26 -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 8, [System.Drawing.FontStyle]::Bold))
+    $lbl.BackColor = [System.Drawing.Color]::Transparent
+    $lbl.Padding = New-Object System.Windows.Forms.Padding(10, 0, 0, 0)
+    $lbl.Margin = New-Object System.Windows.Forms.Padding(6, 15, 6, 2)
     return $lbl
+}
+
+function New-ToolboxCardButton {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][System.Drawing.Color]$AccentColor,
+        [Parameter(Mandatory)][scriptblock]$OnClick
+    )
+    $button = New-Object System.Windows.Forms.Button
+    $button.Size = New-Object System.Drawing.Size(236, 82)
+    $button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 12, 12)
+    $button.Text = "$Title`r`n$Description"
+    $button.TextAlign = 'MiddleLeft'
+    $button.Padding = New-Object System.Windows.Forms.Padding(16, 7, 10, 7)
+    $button.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.2)
+    Set-ModernButtonStyle -Button $button -BaseColor $Script:GUIColors.Surface -TextColor $Script:GUIColors.Text -HoverColor $Script:GUIColors.SurfaceAlt
+    $button.FlatAppearance.BorderColor = $AccentColor
+    $button.FlatAppearance.BorderSize = 1
+    $button.Add_Click($OnClick)
+    return $button
+}
+
+function Show-ToolboxHome {
+    if (-not $Script:LogPanel -or $Script:LogPanel.IsDisposed) { return }
+    Close-CurrentPanel
+    if ($Script:LogBox) { $Script:LogBox.Visible = $false }
+    if ($Script:LogHeader) { $Script:LogHeader.Visible = $false }
+
+    $homePanel = New-Object System.Windows.Forms.Panel
+    $homePanel.Dock = 'Fill'
+    $homePanel.AutoScroll = $false
+    $homePanel.BackColor = $Script:GUIColors.BG
+    $homePanel.Padding = New-Object System.Windows.Forms.Padding(28, 24, 24, 22)
+
+    $content = New-Object System.Windows.Forms.FlowLayoutPanel
+    $content.Dock = 'Fill'
+    $content.FlowDirection = 'TopDown'
+    $content.WrapContents = $false
+    $content.AutoScroll = $true
+    $content.HorizontalScroll.Enabled = $false
+    $content.HorizontalScroll.Visible = $false
+    $content.BackColor = $Script:GUIColors.BG
+    $homePanel.Controls.Add($content)
+
+    $hero = New-Object System.Windows.Forms.Panel
+    $hero.Size = New-Object System.Drawing.Size(820, 128)
+    $hero.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 18)
+    $hero.BackColor = $Script:GUIColors.Surface
+
+    $heroAccent = New-Object System.Windows.Forms.Panel
+    $heroAccent.Dock = 'Left'
+    $heroAccent.Width = 4
+    $heroAccent.BackColor = $Script:GUIColors.Accent
+    $hero.Controls.Add($heroAccent)
+
+    $eyebrow = New-Object System.Windows.Forms.Label
+    $eyebrow.Text = 'CENTRO DE SOPORTE'
+    $eyebrow.Location = New-Object System.Drawing.Point(24, 18)
+    $eyebrow.Size = New-Object System.Drawing.Size(500, 18)
+    $eyebrow.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8, [System.Drawing.FontStyle]::Bold)
+    $eyebrow.ForeColor = $Script:GUIColors.Accent
+    $hero.Controls.Add($eyebrow)
+
+    $welcome = New-Object System.Windows.Forms.Label
+    $welcome.Text = '¿Qué necesitas resolver hoy?'
+    $welcome.Location = New-Object System.Drawing.Point(21, 42)
+    $welcome.Size = New-Object System.Drawing.Size(600, 34)
+    $welcome.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20, [System.Drawing.FontStyle]::Bold)
+    $welcome.ForeColor = $Script:GUIColors.Text
+    $hero.Controls.Add($welcome)
+
+    $profile = New-Object System.Windows.Forms.Label
+    $profile.Text = "Equipo: $env:COMPUTERNAME   |   Perfil detectado: $(Get-PerfilEquipo)"
+    $profile.Location = New-Object System.Drawing.Point(25, 83)
+    $profile.Size = New-Object System.Drawing.Size(740, 24)
+    $profile.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $profile.ForeColor = $Script:GUIColors.TextDim
+    $hero.Controls.Add($profile)
+
+    $readyBadge = New-Object System.Windows.Forms.Label
+    $readyBadge.Text = '  LISTO  |  ADMINISTRADOR  '
+    $readyBadge.Location = New-Object System.Drawing.Point(590, 20)
+    $readyBadge.Size = New-Object System.Drawing.Size(198, 30)
+    $readyBadge.Anchor = 'Top, Right'
+    $readyBadge.TextAlign = 'MiddleCenter'
+    $readyBadge.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8, [System.Drawing.FontStyle]::Bold)
+    $readyBadge.ForeColor = $Script:GUIColors.Success
+    $readyBadge.BackColor = $Script:GUIColors.SurfaceAlt
+    $hero.Controls.Add($readyBadge)
+    $content.Controls.Add($hero)
+
+    $quickTitle = New-Object System.Windows.Forms.Label
+    $quickTitle.Text = 'ACCESOS RÁPIDOS'
+    $quickTitle.Size = New-Object System.Drawing.Size(820, 26)
+    $quickTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold)
+    $quickTitle.ForeColor = $Script:GUIColors.TextDim
+    $quickTitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    $content.Controls.Add($quickTitle)
+
+    $quick = New-Object System.Windows.Forms.FlowLayoutPanel
+    $quick.Size = New-Object System.Drawing.Size(820, 188)
+    $quick.FlowDirection = 'LeftToRight'
+    $quick.WrapContents = $true
+    $quick.BackColor = $Script:GUIColors.BG
+    $quick.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Diagnóstico inteligente' -Description 'Revisión completa + reporte PDF' -AccentColor $Script:GUIColors.Accent -OnClick {
+        Show-Accion -Titulo 'Diagnostico Inteligente' -Subtitulo 'Analisis priorizado y reporte PDF profesional' -Color 'Magenta' -Accion { Invoke-DiagnosticoInteligenteCONTPAQi }
+    }))
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Revisar terminal' -Description 'Servicios y licenciamiento local' -AccentColor $Script:GUIColors.Success -OnClick {
+        Show-Accion -Titulo 'Estado Terminal' -Subtitulo 'AuthServer' -Color 'DarkCyan' -Accion { Show-EstadoServiciosTerminal }
+    }))
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Validar conexión' -Description 'Servidor, puertos y carpetas' -AccentColor $Script:GUIColors.Warning -OnClick {
+        Show-Accion -Titulo 'Terminal hacia Servidor' -Subtitulo 'Puertos + firewall + carpetas + licencias' -Color 'DarkCyan' -Accion { Invoke-DiagnosticoTerminalServidorCONTPAQi }
+    }))
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Salud de SQL' -Description 'Capacidad, respaldos y actividad' -AccentColor $Script:GUIColors.Accent -OnClick {
+        Show-Accion -Titulo 'Salud de SQL Server' -Subtitulo 'Capacidad, respaldos, actividad y espacio por empresa' -Color 'Magenta' -Accion { Show-SaludSQLProfesional }
+    }))
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Centro SAT / CFDI' -Description 'Equipo, PAC y servicios SAT' -AccentColor $Script:GUIColors.Warning -OnClick {
+        Show-Accion -Titulo 'Centro SAT / CFDI' -Subtitulo 'Equipo vs CONTPAQi vs PAC vs SAT' -Color 'Magenta' -Accion { Show-DiagnosticoTimbrado }
+    }))
+    $quick.Controls.Add((New-ToolboxCardButton -Title 'Abrir reportes' -Description 'Consulta diagnósticos anteriores' -AccentColor $Script:GUIColors.TextDim -OnClick {
+        try {
+            if (-not (Test-Path -LiteralPath $Script:ReportDirectory -PathType Container)) { New-Item -ItemType Directory -Path $Script:ReportDirectory -Force | Out-Null }
+            Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$Script:ReportDirectory`"" | Out-Null
+        } catch { Write-Log -Mensaje "No se pudo abrir la carpeta de reportes: $($_.Exception.Message)" -Nivel ERROR }
+    }))
+    $content.Controls.Add($quick)
+
+    $tip = New-Object System.Windows.Forms.Label
+    $tip.Text = 'Consejo: comienza con un diagnóstico. Las reparaciones avanzadas están agrupadas y protegidas para evitar cambios accidentales.'
+    $tip.Size = New-Object System.Drawing.Size(820, 48)
+    $tip.Padding = New-Object System.Windows.Forms.Padding(16, 0, 14, 0)
+    $tip.TextAlign = 'MiddleLeft'
+    $tip.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $tip.ForeColor = $Script:GUIColors.TextDim
+    $tip.BackColor = $Script:GUIColors.Surface
+    $content.Controls.Add($tip)
+
+    $welcomeFontNormal = New-Object System.Drawing.Font('Segoe UI Semibold', 20, [System.Drawing.FontStyle]::Bold)
+    $welcomeFontCompact = New-Object System.Drawing.Font('Segoe UI Semibold', 15, [System.Drawing.FontStyle]::Bold)
+    $homePanel.Add_Disposed({
+        $welcomeFontNormal.Dispose()
+        $welcomeFontCompact.Dispose()
+    }.GetNewClosure())
+
+    $resizeHome = {
+        $available = [Math]::Max(340, $content.ClientSize.Width - 24)
+        $hero.Width = $available
+        $quickTitle.Width = $available
+        $quick.Width = $available
+        $tip.Width = $available
+
+        $columns = if ($available -ge 760) { 3 } elseif ($available -ge 510) { 2 } else { 1 }
+        $gap = 12
+        $cardWidth = [Math]::Max(220, [int](($available - (($columns - 1) * $gap)) / $columns))
+        foreach ($card in $quick.Controls) {
+            if ($card -is [System.Windows.Forms.Button]) { $card.Width = $cardWidth }
+        }
+        $rows = [Math]::Ceiling($quick.Controls.Count / [double]$columns)
+        $quick.Height = [int]($rows * 94)
+
+        $compact = $available -lt 650
+        $readyBadge.Visible = -not $compact
+        $welcome.Font = if ($compact) { $welcomeFontCompact } else { $welcomeFontNormal }
+        $welcome.Width = if ($compact) { [Math]::Max(260, $available - 48) } else { 550 }
+        $profile.Width = [Math]::Max(260, $available - 50)
+        $content.HorizontalScroll.Enabled = $false
+        $content.HorizontalScroll.Visible = $false
+    }.GetNewClosure()
+    $homePanel.Add_Resize($resizeHome)
+    $content.Add_Resize($resizeHome)
+
+    $Script:LogPanel.Controls.Add($homePanel)
+    $homePanel.BringToFront()
+    $Script:CurrentPanel = $homePanel
+    & $resizeHome
 }
 
 function Build-GUIForm {
@@ -8850,38 +9058,38 @@ function Build-GUIForm {
     # --- HEADER PANEL ---
     $headerPanel = New-Object System.Windows.Forms.Panel
     $headerPanel.Dock = 'Top'
-    $headerPanel.Height = 78
+    $headerPanel.Height = 74
     $headerPanel.BackColor = $Script:GUIColors.Header
     $form.Controls.Add($headerPanel)
 
     $Script:HeaderTitle = New-Object System.Windows.Forms.Label
-    $Script:HeaderTitle.Text = 'CONTPAQi  //  TOOLBOX'
-    $Script:HeaderTitle.Location = New-Object System.Drawing.Point(92, 12)
+    $Script:HeaderTitle.Text = 'CONTPAQi Toolbox'
+    $Script:HeaderTitle.Location = New-Object System.Drawing.Point(86, 10)
     $Script:HeaderTitle.Size = New-Object System.Drawing.Size(620, 32)
-    $Script:HeaderTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 19, [System.Drawing.FontStyle]::Bold)
+    $Script:HeaderTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 18, [System.Drawing.FontStyle]::Bold)
     $Script:HeaderTitle.ForeColor = $Script:GUIColors.Accent
     $Script:HeaderTitle.BackColor = [System.Drawing.Color]::Transparent
     $headerPanel.Controls.Add($Script:HeaderTitle)
 
     $Script:HeaderSub = New-Object System.Windows.Forms.Label
-    $Script:HeaderSub.Text = 'Diagnostico y mantenimiento profesional CONTPAQi'
-    $Script:HeaderSub.Location = New-Object System.Drawing.Point(94, 47)
+    $Script:HeaderSub.Text = 'Diagnóstico, mantenimiento y monitoreo en un solo lugar'
+    $Script:HeaderSub.Location = New-Object System.Drawing.Point(88, 43)
     $Script:HeaderSub.Size = New-Object System.Drawing.Size(620, 20)
     $Script:HeaderSub.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $Script:HeaderSub.ForeColor = $Script:GUIColors.TextDim
     $Script:HeaderSub.BackColor = [System.Drawing.Color]::Transparent
     $headerPanel.Controls.Add($Script:HeaderSub)
 
-    $mainLogo = New-ToolboxLogoPictureBox -Size 58
-    $mainLogo.Location = New-Object System.Drawing.Point(20, 9)
+    $mainLogo = New-ToolboxLogoPictureBox -Size 50
+    $mainLogo.Location = New-Object System.Drawing.Point(20, 11)
     $headerPanel.Controls.Add($mainLogo)
 
     $verLabel = New-Object System.Windows.Forms.Label
-    $verLabel.Text = "v$($Script:Version)"
-    $verLabel.Location = New-Object System.Drawing.Point(1120, 22)
-    $verLabel.Size = New-Object System.Drawing.Size(82, 32)
+    $verLabel.Text = "  ADMIN  •  v$($Script:Version)  "
+    $verLabel.Location = New-Object System.Drawing.Point(1050, 20)
+    $verLabel.Size = New-Object System.Drawing.Size(152, 32)
     $verLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold)
-    $verLabel.ForeColor = $Script:GUIColors.Accent
+    $verLabel.ForeColor = $Script:GUIColors.Success
     $verLabel.TextAlign = 'MiddleCenter'
     $verLabel.BackColor = $Script:GUIColors.Surface
     $verLabel.Anchor = 'Top, Right'
@@ -8925,9 +9133,9 @@ function Build-GUIForm {
     # --- MAIN SPLIT PANEL ---
     $mainSplit = New-Object System.Windows.Forms.SplitContainer
     $mainSplit.Dock = 'Fill'
-    $mainSplit.SplitterDistance = [Math]::Min(276, [Math]::Max(238, [int]($initialWidth * 0.28)))
+    $mainSplit.SplitterDistance = [Math]::Min(264, [Math]::Max(230, [int]($initialWidth * 0.25)))
     $mainSplit.FixedPanel = 'Panel1'
-    $mainSplit.Panel1MinSize = 230
+    $mainSplit.Panel1MinSize = 220
     $mainSplit.BackColor = $Script:GUIColors.BG
     $mainSplit.SplitterWidth = 1
     $mainSplit.SplitterIncrement = 1
@@ -8943,7 +9151,7 @@ $sidebar.FlowDirection = 'TopDown'
 $sidebar.WrapContents = $false
 $sidebar.AutoScroll = $true
 $sidebar.BackColor = $Script:GUIColors.Sidebar
-$sidebar.Padding = New-Object System.Windows.Forms.Padding(10, 8, 8, 12)
+$sidebar.Padding = New-Object System.Windows.Forms.Padding(10, 12, 8, 14)
 $sidebar.HorizontalScroll.Enabled = $false
 $sidebar.HorizontalScroll.Visible = $false
 $sidebarOuter.Controls.Add($sidebar)
@@ -8966,18 +9174,22 @@ $Script:Sidebar = $sidebar
 
     $btnFont = New-Object System.Drawing.Font('Segoe UI', 9.2)
 
-    # --- DIAGNOSTICO Y REPORTES ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'DIAGNOSTICO Y REPORTES'))
+    $sidebar.Controls.Add((New-GUIButton -Text 'Inicio' -H 44 -BgColor $Script:GUIColors.AccentDark -TextColor $Script:GUIColors.Text -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 9.5, [System.Drawing.FontStyle]::Bold)) -OnClick {
+        Show-ToolboxHome
+    }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[J] Diagnostico Inteligente + PDF' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    # --- DIAGNOSTICO Y REPORTES ---
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'Diagnóstico'))
+
+    $sidebar.Controls.Add((New-GUIButton -Text 'Diagnóstico inteligente + PDF' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Diagnostico Inteligente' -Subtitulo 'Analisis priorizado y reporte PDF profesional' -Color 'Magenta' -Accion { Invoke-DiagnosticoInteligenteCONTPAQi }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[F] Centro SAT / CFDI' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Centro SAT / CFDI' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Centro SAT / CFDI' -Subtitulo 'Equipo vs CONTPAQi vs PAC vs SAT' -Color 'Magenta' -Accion { Show-DiagnosticoTimbrado }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[L] Abrir Reportes' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Abrir reportes' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
         try {
             if (-not (Test-Path -LiteralPath $Script:ReportDirectory -PathType Container)) {
                 New-Item -ItemType Directory -Path $Script:ReportDirectory -Force -ErrorAction Stop | Out-Null
@@ -8989,95 +9201,142 @@ $Script:Sidebar = $sidebar
     }))
 
     # --- TERMINAL ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'TERMINAL - SOLUCIONES RAPIDAS'))
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'Terminal'))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[G] Revisar Terminal' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Revisar terminal' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Estado Terminal' -Subtitulo 'AuthServer' -Color 'DarkCyan' -Accion { Show-EstadoServiciosTerminal }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[C] Validar Servidor y Accesos' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Validar servidor y accesos' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Terminal hacia Servidor' -Subtitulo 'Puertos + firewall + carpetas + licencias' -Color 'DarkCyan' -Accion { Invoke-DiagnosticoTerminalServidorCONTPAQi }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[H] Reparar Terminal' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Accent -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Reparar terminal' -BgColor $Script:GUIColors.TerminalBtn -TextColor $Script:GUIColors.Accent -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Reparacion Avanzada de Terminal' -Subtitulo 'Servicios + ACL + Windows + red + verificacion real' -Color 'DarkCyan' -Accion { Reset-TerminalRapido }
     }))
 
     # --- SERVIDOR ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'SERVIDOR - ACCIONES AVANZADAS'))
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'Servidor y SQL'))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[I] Revisar Servidor' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Revisar servidor' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Text -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Estado PID' -Subtitulo 'Servidor' -Color 'Red' -Accion { Show-EstadoPIDServidor }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[D] Analisis del Servidor' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Análisis del servidor' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Analisis del Servidor' -Subtitulo 'Autodeteccion e inventario remoto profundo' -Color 'Magenta' -Accion { Show-AnalisisProfundoServidorCONTPAQi }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[S] Salud de SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Salud de SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Accent -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Salud de SQL Server' -Subtitulo 'Capacidad, respaldos, actividad y espacio por empresa' -Color 'Magenta' -Accion { Show-SaludSQLProfesional }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[M] Mantenimiento SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Mantenimiento SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Mantenimiento SQL' -Subtitulo 'Respaldo, integridad, indices y estadisticas' -Color 'Green' -Accion { Invoke-MantenimientoSQLProfesional }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[R] Reparacion Profunda' -BgColor $Script:GUIColors.ServerBtn -TextColor ([System.Drawing.Color]::White) -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $advancedToggle = New-GUIButton -Text 'Mostrar acciones avanzadas' -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.Warning -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold)) -OnClick { }
+    $sidebar.Controls.Add($advancedToggle)
+
+    $deepRepairButton = New-GUIButton -Text 'Reparación profunda' -BgColor $Script:GUIColors.ServerBtn -TextColor ([System.Drawing.Color]::White) -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-Accion -Titulo 'Reparacion Profunda' -Subtitulo 'Reinicio controlado y validacion completa' -Color 'Red' -Accion { Invoke-ReparacionProfundaCONTPAQi }
-    }))
+    }
+    $deepRepairButton.Visible = $false
+    $sidebar.Controls.Add($deepRepairButton)
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[5] Cerrar Sesiones CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
+    $closeSessionsButton = New-GUIButton -Text 'Cerrar sesiones CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Expulsar Usuarios' -Subtitulo 'Servidor RDS' -Color 'Red' -Accion { Expulsar-UsuariosSistemas }
-    }))
+    }
+    $closeSessionsButton.Visible = $false
+    $sidebar.Controls.Add($closeSessionsButton)
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[!] Reparacion Total Servidor' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
+    $totalRepairButton = New-GUIButton -Text 'Reparación total del servidor' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Reparacion Total del Servidor' -Subtitulo '14 etapas: DISM/SFC + Red + SQL + CONTPAQi' -Color 'Red' -Accion { Ejecutar-SuperReset }
-    }))
+    }
+    $totalRepairButton.Visible = $false
+    $sidebar.Controls.Add($totalRepairButton)
+
+    $advancedButtons = @($deepRepairButton, $closeSessionsButton, $totalRepairButton)
+    $advancedToggle.Add_Click({
+        $show = -not $advancedButtons[0].Visible
+        foreach ($button in $advancedButtons) { $button.Visible = $show }
+        $advancedToggle.Text = if ($show) { 'Ocultar acciones avanzadas' } else { 'Mostrar acciones avanzadas' }
+        $sidebar.PerformLayout()
+    }.GetNewClosure())
 
     # --- MONITOREO AUTOMATICO ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'MONITOREO AUTOMATICO'))
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'Monitoreo'))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[W] ServicesDev' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'ServicesDev' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Success -Font (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         Show-ServicesDevMonitor
     }))
 
     # --- ADMINISTRACION ---
-    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'ADMINISTRACION'))
+    $sidebar.Controls.Add((New-GUISeccionLabel -Text 'Administración'))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[7] Cambiar Contrasena SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Cambiar contraseña SQL' -BgColor $Script:GUIColors.SupportBtn -TextColor $Script:GUIColors.Warning -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Cambiar Contrasena SQL' -Subtitulo 'Login sa' -Color 'Green' -Accion { Restablecer-ContrasenaSQL }
     }))
 
-    $sidebar.Controls.Add((New-GUIButton -Text '[U] Desinstalar CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Desinstalar CONTPAQi' -BgColor $Script:GUIColors.ServerBtn -TextColor $Script:GUIColors.Error -Font $btnFont -OnClick {
         Show-Accion -Titulo 'Desinstalar' -Subtitulo 'Cualquier version' -Color 'Red' -Accion { Show-MenuDesinstalar }
     }))
 
     # --- BOTON SALIR ---
-    $sidebar.Controls.Add((New-GUIButton -Text '[SALIR]' -H 38 -BgColor $Script:GUIColors.Error -TextColor ([System.Drawing.Color]::White) -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Bold)) -OnClick {
+    $sidebar.Controls.Add((New-GUIButton -Text 'Cerrar Toolbox' -H 40 -BgColor $Script:GUIColors.Button -TextColor $Script:GUIColors.TextDim -Font (New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold)) -OnClick {
         $form.Close()
     }))
 
     # --- LOG OUTPUT PANEL ---
     $Script:LogPanel = $mainSplit.Panel2
     $Script:LogPanel.BackColor = $Script:GUIColors.LogBG
-    $Script:LogPanel.Padding = New-Object System.Windows.Forms.Padding(18, 14, 18, 16)
+    $Script:LogPanel.Padding = New-Object System.Windows.Forms.Padding(20, 18, 20, 18)
 
-    $logHeader = New-Object System.Windows.Forms.Label
+    $logHeader = New-Object System.Windows.Forms.Panel
     $logHeader.Dock = 'Top'
-    $logHeader.Height = 36
-    $logHeader.Text = '  CENTRO DE DIAGNOSTICO  /  ACTIVIDAD EN VIVO'
-    $logHeader.TextAlign = 'MiddleLeft'
-    $logHeader.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9, [System.Drawing.FontStyle]::Bold)
-    $logHeader.ForeColor = $Script:GUIColors.Accent
+    $logHeader.Height = 46
     $logHeader.BackColor = $Script:GUIColors.Surface
     $Script:LogPanel.Controls.Add($logHeader)
     $Script:LogHeader = $logHeader
+
+    $logTitle = New-Object System.Windows.Forms.Label
+    $logTitle.Dock = 'Fill'
+    $logTitle.Text = '   Actividad y resultados'
+    $logTitle.TextAlign = 'MiddleLeft'
+    $logTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5, [System.Drawing.FontStyle]::Bold)
+    $logTitle.ForeColor = $Script:GUIColors.Text
+    $logTitle.BackColor = $Script:GUIColors.Surface
+    $logHeader.Controls.Add($logTitle)
+
+    $clearLogButton = New-Object System.Windows.Forms.Button
+    $clearLogButton.Dock = 'Right'
+    $clearLogButton.Width = 82
+    $clearLogButton.Text = 'Limpiar'
+    $clearLogButton.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    Set-ModernButtonStyle -Button $clearLogButton -BaseColor $Script:GUIColors.Surface -TextColor $Script:GUIColors.TextDim -HoverColor $Script:GUIColors.SurfaceAlt
+    $clearLogButton.FlatAppearance.BorderSize = 0
+    $clearLogButton.Add_Click({ if ($Script:LogBox) { $Script:LogBox.Clear() } })
+    $logHeader.Controls.Add($clearLogButton)
+
+    $copyLogButton = New-Object System.Windows.Forms.Button
+    $copyLogButton.Dock = 'Right'
+    $copyLogButton.Width = 82
+    $copyLogButton.Text = 'Copiar'
+    $copyLogButton.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    Set-ModernButtonStyle -Button $copyLogButton -BaseColor $Script:GUIColors.Surface -TextColor $Script:GUIColors.Accent -HoverColor $Script:GUIColors.SurfaceAlt
+    $copyLogButton.FlatAppearance.BorderSize = 0
+    $copyLogButton.Add_Click({
+        if ($Script:LogBox -and -not [string]::IsNullOrWhiteSpace($Script:LogBox.Text)) {
+            try { [System.Windows.Forms.Clipboard]::SetText($Script:LogBox.Text) } catch { }
+        }
+    })
+    $logHeader.Controls.Add($copyLogButton)
+    $copyLogButton.BringToFront()
 
     $Script:LogBox = New-Object System.Windows.Forms.RichTextBox
     $Script:LogBox.Dock = 'Fill'
     $Script:LogBox.BackColor = $Script:GUIColors.LogBG
     $Script:LogBox.ForeColor = $Script:GUIColors.Text
-    $Script:LogBox.Font = New-Object System.Drawing.Font('Cascadia Mono', 10)
+    $Script:LogBox.Font = New-Object System.Drawing.Font('Cascadia Mono', 9.5)
     $Script:LogBox.ReadOnly = $true
     $Script:LogBox.BorderStyle = 'None'
     $Script:LogBox.ScrollBars = 'Vertical'
@@ -9088,7 +9347,7 @@ $Script:Sidebar = $sidebar
     $form.Controls.SetChildIndex($mainSplit, 0)
     $form.PerformLayout()
     $mainSplit.Panel2MinSize = 320
-    $mainSplit.SplitterDistance = [Math]::Min(276, [Math]::Max(238, [int]($form.ClientSize.Width * 0.28)))
+    $mainSplit.SplitterDistance = [Math]::Min(264, [Math]::Max(230, [int]($form.ClientSize.Width * 0.25)))
 
     $Script:GUIForm = $form
     return $form
@@ -9160,6 +9419,7 @@ try {
         if ($Script:LogFile) {
             Write-Log -Mensaje "Bitacora de esta sesion: $Script:LogFile" -Nivel INFO
         }
+        Show-ToolboxHome
         $form.ShowDialog() | Out-Null
     }
 } finally {
